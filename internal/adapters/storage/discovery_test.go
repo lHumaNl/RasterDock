@@ -1,0 +1,150 @@
+package storage_test
+
+import (
+	"context"
+	"crypto/sha256"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
+	"testing"
+
+	"rasterdock/internal/adapters/storage"
+	"rasterdock/internal/application"
+	"rasterdock/internal/domain"
+)
+
+func TestDiscoveryExistingLiveAndClosedState(t *testing.T) {
+	state := t.TempDir()
+	p, err := application.Prepare(t.Context(), t.TempDir(), state, 512, storage.Flush)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := domain.NewID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := filepath.Join(state, "transfers", domain.IDString(p.Descriptor.Transfer), "receive", domain.IDString(id))
+	dest := t.TempDir()
+	r, err := storage.OpenReceive(session, dest, p.Descriptor, application.DecodeManifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = r.Close() })
+	assertDiscovered(t, state, p.Directory, session, dest)
+	if other, e := storage.OpenReceive(session, dest, p.Descriptor, application.DecodeManifest); e == nil {
+		_ = other.Close()
+		t.Fatal("discovery stole ownership")
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assertDiscovered(t, state, p.Directory, session, dest)
+}
+
+func assertDiscovered(t *testing.T, state, sender, session, dest string) {
+	t.Helper()
+	before := sessionFiles(t, session)
+	got, err := storage.Discover(t.Context(), state)
+	if !reflect.DeepEqual(before, sessionFiles(t, session)) {
+		t.Fatal("discovery changed original session files")
+	}
+	if err != nil || len(got.Issues) != 0 {
+		t.Fatalf("discovery: %+v, %v", got, err)
+	}
+	if len(got.Senders) != 1 || got.Senders[0].Directory != sender {
+		t.Fatalf("senders: %+v", got.Senders)
+	}
+	if len(got.Receivers) != 1 || got.Receivers[0].Directory != session || got.Receivers[0].Destination != dest {
+		t.Fatalf("receivers: %+v", got.Receivers)
+	}
+}
+
+func sessionFiles(t *testing.T, session string) map[string][32]byte {
+	t.Helper()
+	entries, err := os.ReadDir(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := make(map[string][32]byte)
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(session, entry.Name())) //nolint:gosec // Test-owned session directory, never real user state.
+		if err != nil {
+			t.Fatal(err)
+		}
+		result[entry.Name()] = sha256.Sum256(data)
+	}
+	return result
+}
+
+func TestDiscoveryCancellationAndEntryLimit(t *testing.T) {
+	state := t.TempDir()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := storage.Discover(ctx, state); !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	transfers := filepath.Join(state, "transfers")
+	if err := os.Mkdir(transfers, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 513; i++ {
+		if err := os.Mkdir(filepath.Join(transfers, fmt.Sprint(i)), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := storage.Discover(t.Context(), state); err == nil {
+		t.Fatal("unbounded inventory")
+	}
+}
+
+func TestDiscoveryRejectsMalformedAndSymlinkDescriptor(t *testing.T) {
+	for _, kind := range []string{"malformed", "symlink", "directory"} {
+		t.Run(kind, func(t *testing.T) { testBadDescriptor(t, kind) })
+	}
+}
+
+func testBadDescriptor(t *testing.T, kind string) {
+	state := t.TempDir()
+	p, err := application.Prepare(t.Context(), t.TempDir(), state, 512, storage.Flush)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready := filepath.Join(p.Directory, "ready.json")
+	if err := os.Remove(ready); err != nil {
+		t.Fatal(err)
+	}
+	switch kind {
+	case "malformed":
+		err = os.WriteFile(ready, []byte("broken"), 0600)
+	case "symlink":
+		err = os.Symlink(filepath.Join(p.Directory, "manifest.zst"), ready)
+	case "directory":
+		err = os.Mkdir(ready, 0700)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := storage.Discover(t.Context(), state)
+	if err != nil || len(got.Senders) != 0 || len(got.Issues) != 1 {
+		t.Fatalf("bad descriptor accepted: %+v, %v", got, err)
+	}
+}
+
+func TestDiscoveryMissingAndSymlinkRoot(t *testing.T) {
+	state := t.TempDir()
+	got, err := storage.Discover(t.Context(), state)
+	if err != nil || len(got.Senders) != 0 {
+		t.Fatalf("empty: %+v %v", got, err)
+	}
+	if err := os.Symlink(t.TempDir(), filepath.Join(state, "transfers")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.Discover(t.Context(), state); err == nil {
+		t.Fatal("followed symlink")
+	}
+}

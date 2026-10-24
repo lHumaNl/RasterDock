@@ -1,0 +1,83 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+env:
+  GOTOOLCHAIN: local
+  CGO_ENABLED: '1'
+jobs:
+  quality:
+    uses: ./.github/workflows/ci.yml
+  build:
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: linux-amd64
+            ext: ''
+          - runner: windows-2022
+            target: windows-amd64
+            ext: .exe
+          - runner: macos-15
+            target: darwin-arm64
+            ext: ''
+          - runner: macos-15-intel
+            target: darwin-amd64
+            ext: ''
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-go@v5.5.0
+        with:
+          go-version-file: .go-version
+      - name: Validate tag
+        run: '[[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]'
+      - name: Linux SDK
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev
+      - name: Build tagged commit
+        run: make build VERSION="$GITHUB_REF_NAME" COMMIT="$GITHUB_SHA" BUILD_TIME="$(date -u +%FT%TZ)"
+      - name: Require signing infrastructure
+        if: runner.os == 'macOS'
+        run: |
+          echo 'Публикация заблокирована: Developer ID signing/notarization ещё не настроены.' >&2
+          exit 1
+      - name: Final executable
+        env:
+          TARGET: ${{ matrix.target }}
+          EXT: ${{ matrix.ext }}
+        run: |
+          mkdir -p dist
+          cp "bin/rasterdock$EXT" "dist/rasterdock-$GITHUB_REF_NAME-$TARGET$EXT"
+      - uses: actions/upload-artifact@v4.6.2
+        with:
+          name: executable-${{ matrix.target }}
+          path: dist/*
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          pattern: executable-*
+          merge-multiple: true
+          path: dist
+      - name: Checksums and notes
+        run: |
+          cd dist
+          sha256sum rasterdock-* > SHA256SUMS.txt
+          printf 'RasterDock %s\nCommit: %s\nNative builds: linux-amd64, windows-amd64, darwin-amd64, darwin-arm64.\nClean-OS/runtime coverage: see implementation-status.md.\n' "$GITHUB_REF_NAME" "$GITHUB_SHA" > release-notes.md
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/rasterdock-* dist/SHA256SUMS.txt --verify-tag --notes-file dist/release-notes.md

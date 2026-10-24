@@ -1,0 +1,36 @@
+version: "2"
+run:
+  go: "1.26"
+  timeout: 5m
+  modules-download-mode: readonly
+  tests: true
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - unused
+    - ineffassign
+    - errorlint
+    - contextcheck
+    - durationcheck
+    - exhaustive
+    - nilerr
+    - nilnil
+    - gocritic
+    - revive
+    - gosec
+    - unconvert
+    - misspell
+  exclusions:
+    rules:
+      # CGO-generated pointer checks produce a false positive at this C call.
+      - path: internal/adapters/platform/capture_darwin.go
+        linters: [gocritic]
+        text: 'dupSubExpr'
+formatters:
+  enable: [gofmt, goimports]
+  settings:
+    goimports:
+      local-prefixes: [rasterdock]
