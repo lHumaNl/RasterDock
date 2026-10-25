@@ -37,7 +37,7 @@ func rejectionLink(t *testing.T, path string, directory bool) func() {
 	check := func() {
 		t.Helper()
 		info, err := os.Lstat(path)
-		if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		if err != nil || info.Mode()&rejectionLinkMode == 0 {
 			t.Fatalf("%s fixture is not a real link: %v, %v", rejectionLinkKind, info, err)
 		}
 		if got, err := os.Readlink(path); err != nil || got != target {

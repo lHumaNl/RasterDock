@@ -11,6 +11,10 @@ import (
 
 const rejectionLinkKind = "junction"
 
+// Go 1.23+ reports mount-point reparse points as irregular, not symlinks.
+// createRejectionLink additionally verifies the actual mount-point reparse tag.
+const rejectionLinkMode = os.ModeIrregular
+
 // A mount-point reparse point requires no symlink privilege or Developer Mode.
 // Use DeviceIoControl directly: no shell interpolation or system configuration.
 func createRejectionLink(t *testing.T, _, dir, path string, _ bool) {

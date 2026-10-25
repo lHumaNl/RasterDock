@@ -151,3 +151,40 @@ func TestDiscoveryMissingAndLinkRoot(t *testing.T) {
 	}
 	checkLink()
 }
+
+func TestDiscoveryRejectsLinkedStateRoot(t *testing.T) {
+	state := filepath.Join(t.TempDir(), "state")
+	checkLink := rejectionLink(t, state, true)
+	if _, err := storage.Discover(t.Context(), state); err == nil {
+		t.Fatalf("followed %s state root", rejectionLinkKind)
+	}
+	checkLink()
+}
+
+func TestDiscoveryRejectsInternalLinkedAncestor(t *testing.T) {
+	state := t.TempDir()
+	p, err := application.Prepare(t.Context(), t.TempDir(), state, 512, storage.Flush)
+	if err != nil {
+		t.Fatal(err)
+	}
+	send := filepath.Dir(p.Directory)
+	retained := filepath.Join(state, "retained-send")
+	if err = os.Rename(send, retained); err != nil {
+		t.Fatal(err)
+	}
+	// Keep the target within os.Root: containment alone must not replace the
+	// inventory's stricter rejection of linked intermediate components.
+	createRejectionLink(t, retained, retained, send, true)
+	t.Cleanup(func() {
+		if err := os.Remove(send); err != nil {
+			t.Error(err)
+		}
+	})
+	got, err := storage.Discover(t.Context(), state)
+	if err != nil || len(got.Senders) != 0 || len(got.Issues) != 1 {
+		t.Fatalf("linked ancestor accepted: %+v, %v", got, err)
+	}
+	if _, err = os.Stat(filepath.Join(retained, "prepared", "ready.json")); err != nil {
+		t.Fatalf("retained descriptor changed: %v", err)
+	}
+}

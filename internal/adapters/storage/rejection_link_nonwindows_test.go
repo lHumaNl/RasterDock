@@ -9,6 +9,8 @@ import (
 
 const rejectionLinkKind = "symlink"
 
+const rejectionLinkMode = os.ModeSymlink
+
 func createRejectionLink(t *testing.T, file, dir, path string, directory bool) {
 	t.Helper()
 	target := file

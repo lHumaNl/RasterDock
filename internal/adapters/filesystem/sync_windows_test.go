@@ -108,3 +108,69 @@ func TestSyncPropagatesSharingViolation(t *testing.T) {
 		t.Fatalf("write reopening sharing error: %v", err)
 	}
 }
+
+func TestSyncDirectoryKeepsPinnedObjectAfterNameReplacement(t *testing.T) {
+	base := t.TempDir()
+	root, err := os.OpenRoot(base)
+	requireNoError(t, err)
+	defer func() { requireNoError(t, root.Close()) }()
+	requireNoError(t, root.Mkdir("original", 0700))
+	f, err := root.Open("original")
+	requireNoError(t, err)
+	defer func() { requireNoError(t, f.Close()) }()
+	want, err := f.Stat()
+	requireNoError(t, err)
+	requireNoError(t, root.Rename("original", "retained"))
+	requireNoError(t, root.Mkdir("original", 0700))
+
+	// Success alone cannot detect flushing the replacement directory. Compare
+	// the reopened handle's identity with the original pinned object as well.
+	raw, err := f.SyscallConn()
+	requireNoError(t, err)
+	var reopened windows.Handle
+	var reopenErr error
+	requireNoError(t, raw.Control(func(handle uintptr) {
+		reopened, reopenErr = reopenWritable(windows.Handle(handle))
+	}))
+	requireNoError(t, reopenErr)
+	reopenedFile := os.NewFile(uintptr(reopened), "pinned-directory-test")
+	defer func() { requireNoError(t, reopenedFile.Close()) }()
+	got, err := reopenedFile.Stat()
+	requireNoError(t, err)
+	if !os.SameFile(want, got) {
+		t.Fatal("write reopening selected a different directory")
+	}
+	requireNoError(t, Sync(f))
+}
+
+func TestSyncDirectoryPropagatesSharingViolation(t *testing.T) {
+	wide, err := windows.UTF16PtrFromString(t.TempDir())
+	requireNoError(t, err)
+	handle, err := windows.CreateFile(wide, windows.GENERIC_READ, windows.FILE_SHARE_READ,
+		nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
+	requireNoError(t, err)
+	f := os.NewFile(uintptr(handle), "exclusive-directory-reader")
+	defer func() { requireNoError(t, f.Close()) }()
+	if err = Sync(f); !errors.Is(err, windows.ERROR_SHARING_VIOLATION) {
+		t.Fatalf("directory write reopening sharing error: %v", err)
+	}
+}
+
+func TestClosedRawControlErrorIsNotNormalizedByGo(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "closed-control")
+	requireNoError(t, err)
+	raw, err := f.SyscallConn()
+	requireNoError(t, err)
+	requireNoError(t, f.Close())
+	called := false
+	controlErr := raw.Control(func(uintptr) { called = true })
+	if called || controlErr == nil {
+		t.Fatalf("closed Control: callback=%v error=%v", called, controlErr)
+	}
+	// Log typed evidence rather than matching the internal poll error's text.
+	t.Logf("RawConn.Control: %T %v; matches os.ErrClosed=%v",
+		controlErr, controlErr, errors.Is(controlErr, os.ErrClosed))
+	if err := f.Sync(); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("File.Sync must normalize the closed error: %v", err)
+	}
+}

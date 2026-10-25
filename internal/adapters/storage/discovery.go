@@ -57,8 +57,8 @@ func Discover(ctx context.Context, state string) (Discovery, error) {
 }
 
 func discoveryRoot(state string) (*os.Root, error) {
-	if info, err := os.Lstat(state); err == nil && info.Mode()&os.ModeSymlink != 0 {
-		return nil, errors.New("symlink state root is not discoverable")
+	if info, err := os.Lstat(state); err == nil && info.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0 {
+		return nil, errors.New("linked or irregular state root is not discoverable")
 	}
 	return os.OpenRoot(state)
 }
@@ -179,7 +179,8 @@ func (s *inventory) receiver(ctx context.Context, id, session, dir string) {
 	s.result.Receivers = append(s.result.Receivers, SavedReceive{id, session, filepath.Join(s.state, dir), destination})
 }
 
-// Reject symlinks at every relative component, including SQLite sidecars.
+// Reject symlinks and irregular reparse points at every relative component,
+// including SQLite sidecars. Go 1.23+ marks Windows junctions ModeIrregular.
 // OpenRoot also prevents a concurrent replacement from escaping the state root.
 func checkedOpen(root *os.Root, path string, directory bool) (*os.File, error) {
 	if err := checkDiscoveryPath(root, path, directory); err != nil {
@@ -203,8 +204,8 @@ func checkDiscoveryPath(root *os.Root, path string, directory bool) error {
 		if err != nil {
 			return err
 		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			return errors.New("symlink state is not discoverable")
+		if info.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0 {
+			return errors.New("linked or irregular state is not discoverable")
 		}
 		if part == path && ((directory && !info.IsDir()) || (!directory && !info.Mode().IsRegular())) {
 			return errors.New("unexpected state file type")
