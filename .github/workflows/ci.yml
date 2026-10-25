@@ -25,16 +25,70 @@ jobs:
       - uses: actions/setup-go@v5.5.0
         with:
           go-version-file: .go-version
+          # Use a rolling cache below: setup-go's exact-key hit never saves
+          # newly compiled normal/race/trimpath objects back to that key.
+          cache: false
       - name: Linux SDK
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev
+      - name: Identify cache paths and toolchain
+        id: cache-paths
+        run: |
+          cc="$(go env CC)"
+          compiler_id="$("$cc" --version)"
+          native_packages=""
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            # apt can update SDKs independently of the hosted image. Include
+            # transitive native dependencies: Go does not track external C libs.
+            native_packages="$(dpkg-query -W -f='${binary:Package}=${Version}\n' | LC_ALL=C sort)"
+          fi
+          compiler_hash="$(printf '%s\n' "${ImageOS:-$RUNNER_OS}" "${ImageVersion:-unknown}" "$cc" "$compiler_id" "$native_packages" | git hash-object --stdin)"
+          tools="$(go env GOPATH)/bin"
+          {
+            echo "modules=$(go env GOMODCACHE)"
+            echo "build=$(go env GOCACHE)"
+            echo "go=$(go env GOVERSION)"
+            echo "compiler=$compiler_hash"
+            echo "lint=$tools/golangci-lint$(go env GOEXE)"
+          } >> "$GITHUB_OUTPUT"
+          echo "GOBIN=$tools" >> "$GITHUB_ENV"
+          echo "$tools" >> "$GITHUB_PATH"
+      - name: Restore Go and linter cache
+        id: go-cache
+        uses: actions/cache/restore@v4.2.4
+        with:
+          path: |
+            ${{ steps.cache-paths.outputs.modules }}
+            ${{ steps.cache-paths.outputs.build }}
+            ${{ steps.cache-paths.outputs.lint }}
+          # Unique write keys allow successful runs to refresh the cache even
+          # when dependencies are unchanged. Prefix lookup selects the newest.
+          key: go-v2-${{ matrix.os }}-${{ runner.arch }}-${{ steps.cache-paths.outputs.go }}-${{ steps.cache-paths.outputs.compiler }}-lint${{ env.GOLANGCI_LINT_VERSION }}-${{ hashFiles('go.mod', 'go.sum', 'Makefile') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            go-v2-${{ matrix.os }}-${{ runner.arch }}-${{ steps.cache-paths.outputs.go }}-${{ steps.cache-paths.outputs.compiler }}-lint${{ env.GOLANGCI_LINT_VERSION }}-${{ hashFiles('go.mod', 'go.sum', 'Makefile') }}-
       - name: Toolchain
+        env:
+          LINT_BINARY: ${{ steps.cache-paths.outputs.lint }}
         run: |
           go version
-          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v${GOLANGCI_LINT_VERSION}
+          if [[ ! -f "$LINT_BINARY" ]]; then
+            go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v${GOLANGCI_LINT_VERSION}
+          fi
+          bash scripts/check-lint-version.sh "$("$LINT_BINARY" version)" "$GOLANGCI_LINT_VERSION"
       - run: make all
       - name: Module drift
         run: git diff --exit-code -- go.mod go.sum
+      - name: Save refreshed Go and linter cache
+        # PRs and release tags may restore the default branch cache, but only
+        # successful default-branch pushes publish a new shared cache.
+        if: success() && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: actions/cache/save@v4.2.4
+        with:
+          path: |
+            ${{ steps.cache-paths.outputs.modules }}
+            ${{ steps.cache-paths.outputs.build }}
+            ${{ steps.cache-paths.outputs.lint }}
+          key: ${{ steps.go-cache.outputs.cache-primary-key }}
       - uses: actions/upload-artifact@v4.6.2
         if: always()
         with:
