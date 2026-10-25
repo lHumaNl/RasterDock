@@ -9,6 +9,7 @@ permissions:
 env:
   GOTOOLCHAIN: local
   CGO_ENABLED: '1'
+  GOLANGCI_LINT_VERSION: '2.11.4'
 jobs:
   quality:
     strategy:
@@ -30,7 +31,7 @@ jobs:
       - name: Toolchain
         run: |
           go version
-          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.4
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v${GOLANGCI_LINT_VERSION}
       - run: make all
       - name: Module drift
         run: git diff --exit-code -- go.mod go.sum

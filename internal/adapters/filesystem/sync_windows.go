@@ -81,7 +81,8 @@ func reopenWritableDirectory(handle windows.Handle) (windows.Handle, error) {
 	// Native directory opens need no backup intent; ordinary ACL checks apply.
 	err := windows.NtCreateFile(&reopened, windows.FILE_GENERIC_WRITE|windows.FILE_READ_ATTRIBUTES, &attrs,
 		&windows.IO_STATUS_BLOCK{}, nil, 0, share, windows.FILE_OPEN, options, 0, 0)
-	if status, ok := err.(windows.NTStatus); ok {
+	var status windows.NTStatus
+	if errors.As(err, &status) {
 		err = status.Errno()
 	}
 	if err != nil {

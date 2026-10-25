@@ -15,6 +15,8 @@ endif
 VERSION ?= dev
 COMMIT ?= dev
 BUILD_TIME ?= dev
+# Empty locally accepts >=2.11.4,<3.0.0; CI supplies its exact installed version.
+GOLANGCI_LINT_VERSION ?=
 EXE := $(shell go env GOEXE)
 LDFLAGS := -X rasterdock/internal/buildinfo.Version=$(VERSION) -X rasterdock/internal/buildinfo.Commit=$(COMMIT) -X rasterdock/internal/buildinfo.BuildTime=$(BUILD_TIME)
 .DEFAULT_GOAL := help
@@ -34,7 +36,8 @@ fmt-check:
 vet:
 	go vet ./...
 lint:
-	golangci-lint version | grep 'version 2.11.4 '
+	bash scripts/check-lint-version-test.sh
+	bash scripts/check-lint-version.sh "$$(golangci-lint version)" "$(GOLANGCI_LINT_VERSION)"
 	golangci-lint config verify
 	golangci-lint run
 	golangci-lint run --build-tags=integration

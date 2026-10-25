@@ -22,7 +22,9 @@ Critic одобрил эту ограниченную проверку и исп
 ## Разработка
 
 Из корня проекта: Go **1.26.2**, CGO, native C toolchain и
-golangci-lint **2.11.4**. macOS: Xcode Command Line Tools; Linux:
+golangci-lint **>=2.11.4, <3.0.0** локально; в CI закреплена **2.11.4**.
+`GOLANGCI_LINT_VERSION` задаёт точную требуемую версию для `make lint`/`make all`;
+локально по умолчанию проверяется диапазон. macOS: Xcode Command Line Tools; Linux:
 компилятор, OpenGL/X11/Wayland development headers; Windows: MinGW-w64,
 Git Bash и GNU Make (рецепты используют bash).
 
