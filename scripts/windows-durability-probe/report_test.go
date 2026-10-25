@@ -29,8 +29,10 @@ func TestReportIncludesCaveat(t *testing.T) {
 	if err := writeReport(&out, newReport()); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "not acceptance proof") {
-		t.Fatal("missing evidence limitation")
+	for _, caveat := range []string{"not acceptance proof", "not production storage acceptance or Receiver recovery evidence", "Process kill is not OS crash, reboot, VM reset, or power-loss evidence"} {
+		if !strings.Contains(out.String(), caveat) {
+			t.Fatalf("missing evidence limitation %q", caveat)
+		}
 	}
 }
 

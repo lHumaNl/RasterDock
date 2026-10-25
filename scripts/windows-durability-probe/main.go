@@ -13,13 +13,20 @@ import (
 )
 
 const (
-	tempPrefix           = "rasterdock-windows-api-probe-"
 	directoryMode        = 0700
 	filesystemBufferSize = 256
 	shareMode            = windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE
 )
 
 func main() {
+	if len(os.Args) != 1 {
+		if len(os.Args) == 2 && os.Args[1] == childMarker {
+			if err := runKillChild(); err != nil {
+				_, _ = fmt.Fprintf(os.Stdout, "ERROR: %v\n", err)
+			}
+		}
+		os.Exit(2) // Distinct from Windows Process.Kill exit code 1; never recurse.
+	}
 	r := newReport()
 	run(r)
 	if err := writeReport(os.Stdout, r); err != nil {
@@ -46,6 +53,7 @@ func run(r *report) {
 	flushCases(r, root)
 	moveCases(r, root)
 	hardlinkCase(r, root)
+	killCases(r, root)
 }
 
 func environment(r *report, root string) {

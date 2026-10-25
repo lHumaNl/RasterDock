@@ -43,7 +43,7 @@ type report struct {
 
 func newReport() *report {
 	return &report{GOOS: runtime.GOOS, GOARCH: runtime.GOARCH,
-		Limitation: "Runtime observations only; not acceptance proof, not proof of durability or power-loss safety. Power-loss tests remain required.",
+		Limitation: "Developer-only API and process-kill observations, not acceptance proof, not production storage acceptance or Receiver recovery evidence. Process kill is not OS crash, reboot, VM reset, or power-loss evidence. Power-loss tests remain required.",
 		Operations: []operation{}}
 }
 

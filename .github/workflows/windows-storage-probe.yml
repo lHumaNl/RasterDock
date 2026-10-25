@@ -12,7 +12,7 @@ jobs:
     timeout-minutes: 15
     defaults:
       run:
-        shell: bash
+        shell: powershell
     steps:
       - uses: actions/checkout@v4.2.2
       - uses: actions/setup-go@v5.5.0
@@ -20,13 +20,15 @@ jobs:
           go-version-file: .go-version
       - name: Test diagnostic helpers
         run: go test -count=1 ./scripts/windows-durability-probe
-      - name: Observe APIs only in a fresh temporary directory
-        run: go run ./scripts/windows-durability-probe > windows-durability-report.json
-      - name: Retain observations even when setup or an invariant fails
+      - name: Build diagnostic (no elevated execution)
+        run: go build -o "$env:RUNNER_TEMP\windows-durability-probe.exe" ./scripts/windows-durability-probe
+      - name: Observe APIs under temporary standard local account
+        run: ./scripts/windows-durability-probe/run-standard-user.ps1 -ProbePath "$env:RUNNER_TEMP\windows-durability-probe.exe" -ArtifactDirectory "$env:GITHUB_WORKSPACE\windows-durability-observations"
+      - name: Retain observations and bootstrap errors even on failure
         if: always()
         uses: actions/upload-artifact@v4.6.2
         with:
           name: windows-storage-api-observations
-          path: windows-durability-report.json
+          path: windows-durability-observations/
           if-no-files-found: warn
           retention-days: 14
