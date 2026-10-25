@@ -78,6 +78,7 @@ type engineHarness struct {
 	cancel   context.CancelFunc
 	prepared *application.Prepared
 	owners   []*observedReceiver
+	streams  []*observedCapture
 	fault    string // Only the serialized engine accesses this value.
 }
 
@@ -100,7 +101,7 @@ func newHarness(t *testing.T) *engineHarness {
 	h := &engineHarness{t: t, commands: make(chan command), events: make(chan snapshot, 1),
 		ticks: make(chan time.Time), steps: make(chan string, 1), done: make(chan struct{}),
 		cancel: cancel, prepared: prepareFixture(t)}
-	deps := engineIO{ticks: h.ticks, capture: h.capture, decode: h.decode, openReceive: h.open}
+	deps := engineIO{ticks: h.ticks, openCapture: h.openCapture, decode: h.decode, openReceive: h.open}
 	root := t.TempDir()
 	go func() {
 		defer close(h.done)
@@ -110,8 +111,45 @@ func newHarness(t *testing.T) *engineHarness {
 	return h
 }
 
+type observedCapture struct {
+	h      *engineHarness
+	closes int
+}
+
+func (h *engineHarness) openCapture(uint32) (captureStream, error) {
+	stream := &observedCapture{h: h}
+	h.streams = append(h.streams, stream)
+	return stream, nil
+}
+
+func (s *observedCapture) Next(context.Context) (platform.Frame, error) {
+	return s.h.capture(0)
+}
+
+func (s *observedCapture) Close() error {
+	s.closes++
+	if s.h.fault == "capture-close" {
+		return errInjected
+	}
+	return nil
+}
+
+func TestReceivePauseClosesCaptureBeforeFirstFrame(t *testing.T) {
+	h := newHarness(t)
+	h.start(receiveCommand(t))
+	h.send(command{kind: "pause"})
+	h.expect("status.paused")
+	h.stop()
+	if len(h.streams) != 1 || h.streams[0].closes != 1 {
+		t.Fatalf("capture stream must be opened and closed once: %v", h.streams)
+	}
+}
+
 func (h *engineHarness) capture(uint32) (platform.Frame, error) {
 	h.fault = <-h.steps
+	if h.fault == "pending" {
+		return platform.Frame{}, platform.ErrFramePending
+	}
 	if h.fault == "capture" {
 		return platform.Frame{}, errInjected
 	}
@@ -200,6 +238,9 @@ func (h *engineHarness) assertReleased(cmd command) {
 	if h.owners[0].closes != 1 {
 		h.t.Errorf("old receiver closed %d times, want 1", h.owners[0].closes)
 	}
+	if len(h.streams) == 0 || h.streams[0].closes != 1 {
+		h.t.Error("old capture stream was not closed exactly once")
+	}
 	r, err := anchoredReceive(cmd.session)(cmd.session, cmd.destination, h.prepared.Descriptor)
 	if err != nil {
 		h.t.Errorf("old session lock not released: %v", err)
@@ -266,6 +307,107 @@ func TestReceiveDecodeMissKeepsCurrentOwner(t *testing.T) {
 	h.stop()
 	if len(h.owners) != 1 || h.owners[0].closes != 1 {
 		t.Error("decode miss or busy command changed receiver ownership")
+	}
+}
+
+func TestReceivePendingCaptureKeepsOwnerUntilPause(t *testing.T) {
+	h := newHarness(t)
+	a := receiveCommand(t)
+	h.start(a)
+	h.tick("")
+	h.assertDestination(a)
+	h.tick("pending")
+	h.send(receiveCommand(t))
+	h.expect("status.busy")
+	h.tick("")
+	h.assertDestination(a)
+	h.send(command{kind: "pause"})
+	h.expect("status.paused")
+	h.stop()
+	h.assertReleased(a)
+	if len(h.owners) != 1 || len(h.streams) != 1 {
+		t.Fatal("pending frame reopened the capture or receiver")
+	}
+}
+
+func TestReceiveCaptureCloseFailureStillReleasesStorage(t *testing.T) {
+	h := newHarness(t)
+	a := receiveCommand(t)
+	h.start(a)
+	h.tick("capture-close")
+	h.assertDestination(a)
+	h.send(command{kind: "pause"})
+	h.expect("status.error")
+	h.stop()
+	h.assertReleased(a)
+}
+
+func TestReceiveInvalidDestinationDoesNotOpenCapture(t *testing.T) {
+	h := newHarness(t)
+	cmd := receiveCommand(t)
+	cmd.destination = filepath.Join(cmd.destination, "absent")
+	h.send(cmd)
+	h.expect("status.error")
+	h.stop()
+	if len(h.streams) != 0 {
+		t.Fatal("capture started before validating destination")
+	}
+}
+
+type cancellationCapture struct {
+	entered chan struct{}
+	closed  chan struct{}
+}
+
+func (s *cancellationCapture) Next(ctx context.Context) (platform.Frame, error) {
+	close(s.entered)
+	<-ctx.Done()
+	return platform.Frame{}, ctx.Err()
+}
+
+func (s *cancellationCapture) Close() error {
+	close(s.closed)
+	return nil
+}
+
+func TestEngineShutdownCancelsPendingCapture(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	commands, events := make(chan command, 1), make(chan snapshot, 1)
+	ticks, done := make(chan time.Time, 1), make(chan struct{})
+	stream := &cancellationCapture{entered: make(chan struct{}), closed: make(chan struct{})}
+	root := t.TempDir()
+	go func() {
+		defer close(done)
+		runEngine(ctx, root, commands, events, slog.New(slog.NewTextHandler(io.Discard, nil)), engineIO{
+			ticks: ticks, openCapture: func(uint32) (captureStream, error) { return stream, nil },
+		})
+	}()
+	commands <- receiveCommand(t)
+	select {
+	case event := <-events:
+		if event.key != "status.waiting" {
+			t.Fatalf("unexpected initial status: %+v", event)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("receive did not start")
+	}
+	ticks <- time.Now()
+	select {
+	case <-stream.entered:
+	case <-time.After(testTimeout):
+		t.Fatal("capture did not start")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(testTimeout):
+		t.Fatal("shutdown blocked in capture")
+	}
+	select {
+	case <-stream.closed:
+	default:
+		t.Fatal("shutdown did not close capture stream")
 	}
 }
 

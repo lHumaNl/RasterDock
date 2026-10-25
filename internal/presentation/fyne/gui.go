@@ -137,7 +137,8 @@ func Run(root string, catalog *locales.Catalog, logger *slog.Logger) {
 	split := container.NewHSplit(container.NewScroll(controls), viewport)
 	split.SetOffset(0.4)
 	w.SetContent(split)
-	w.Resize(fyne.NewSize(1150, 800))
+	desiredSize := fyne.NewSize(1150, 800)
+	w.Resize(initialWindowSize(desiredSize))
 	var closing atomic.Bool
 	w.SetCloseIntercept(func() {
 		if closing.Swap(true) {
@@ -172,7 +173,9 @@ func Run(root string, catalog *locales.Catalog, logger *slog.Logger) {
 								options[i] = fmt.Sprintf("%d · %s", s.ID, s.Title)
 							}
 							windows.Options = options
-							windows.Refresh()
+							// Enumeration may retire native selection tokens. Require an
+							// explicit choice from the refreshed list, never a stale label.
+							windows.ClearSelected()
 						}
 						if event.session != "" {
 							session.SetText(event.session)
@@ -186,7 +189,11 @@ func Run(root string, catalog *locales.Catalog, logger *slog.Logger) {
 			}
 		}
 	}()
-	w.ShowAndRun()
+	w.Show()
+	if err := reconcileInitialWindowSize(w, desiredSize); err != nil {
+		logger.Warn("initial_window_geometry_failed", "error", err)
+	}
+	a.Run()
 	cancel()
 }
 
@@ -194,7 +201,8 @@ func engine(ctx context.Context, root string, commands <-chan command, events ch
 	tick := time.NewTicker(200 * time.Millisecond)
 	defer tick.Stop()
 	runEngine(ctx, root, commands, events, logger, engineIO{
-		ticks: tick.C, capture: platform.Capture, decode: codec.Decode, openReceive: anchoredReceive(root),
+		ticks: tick.C, openCapture: func(id uint32) (captureStream, error) { return platform.OpenCapture(id) },
+		decode: codec.Decode, openReceive: anchoredReceive(root),
 	})
 }
 
@@ -221,6 +229,7 @@ func runEngine(ctx context.Context, root string, commands <-chan command, events
 	}
 	var prepared *application.Prepared
 	var receiver receiveOwner
+	var stream captureStream
 	var mode string
 	var ordinal, frame, epoch uint64
 	var playback *presentation.Playback
@@ -229,11 +238,15 @@ func runEngine(ctx context.Context, root string, commands <-chan command, events
 	stop := func() error {
 		mode = ""
 		receive = command{}
-		if receiver == nil {
-			return nil
+		var err error
+		if stream != nil {
+			err = stream.Close()
+			stream = nil
 		}
-		err := receiver.Close()
-		receiver = nil
+		if receiver != nil {
+			err = errors.Join(err, receiver.Close())
+			receiver = nil
+		}
 		return err
 	}
 	fail := func(err error) {
@@ -318,7 +331,7 @@ func runEngine(ctx context.Context, root string, commands <-chan command, events
 				var sources []platform.Source
 				sources, err = platform.Sources()
 				if err == nil {
-					emit(snapshot{key: "status.idle", sources: sources})
+					emit(snapshot{key: "status.idle", sources: append([]platform.Source{}, sources...)})
 				}
 			case "receive":
 				// Never assign a new destination/session to an existing owner.
@@ -333,6 +346,9 @@ func runEngine(ctx context.Context, root string, commands <-chan command, events
 				info, err = os.Stat(cmd.destination)
 				if err == nil && !info.IsDir() {
 					err = errors.New("destination is not a directory")
+				}
+				if err == nil {
+					stream, err = io.openCapture(cmd.window)
 				}
 				if err == nil {
 					receive = cmd
@@ -354,7 +370,13 @@ func runEngine(ctx context.Context, root string, commands <-chan command, events
 			if mode != "receive" {
 				continue
 			}
-			capture, err := io.capture(receive.window)
+			capture, err := stream.Next(ctx)
+			if ctx.Err() != nil {
+				return // Normal GUI shutdown; deferred stop still checks cleanup.
+			}
+			if errors.Is(err, platform.ErrFramePending) {
+				continue
+			}
 			if err != nil {
 				fail(err)
 				continue

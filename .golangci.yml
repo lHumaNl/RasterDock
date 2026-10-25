@@ -26,7 +26,7 @@ linters:
   exclusions:
     rules:
       # CGO-generated pointer checks produce a false positive at this C call.
-      - path: internal/adapters/platform/capture_darwin.go
+      - path: internal/adapters/platform/capture_(darwin|windows)\.go
         linters: [gocritic]
         text: 'dupSubExpr'
 formatters:

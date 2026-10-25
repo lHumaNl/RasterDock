@@ -1,6 +1,7 @@
 package fyneui
 
 import (
+	"context"
 	"image"
 	"time"
 
@@ -9,6 +10,11 @@ import (
 	"rasterdock/internal/application"
 	v1 "rasterdock/internal/protocol/v1"
 )
+
+type captureStream interface {
+	Next(context.Context) (platform.Frame, error)
+	Close() error
+}
 
 type receiveOwner interface {
 	Close() error
@@ -22,7 +28,7 @@ type receiveOwner interface {
 // Per-engine boundaries keep tests headless without mutable package-level hooks.
 type engineIO struct {
 	ticks       <-chan time.Time
-	capture     func(uint32) (platform.Frame, error)
+	openCapture func(uint32) (captureStream, error)
 	decode      func(image.Image) (v1.Beacon, []v1.Packet, error)
 	openReceive func(string, string, v1.Descriptor) (receiveOwner, error)
 }

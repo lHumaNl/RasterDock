@@ -1,4 +1,4 @@
-//go:build integration && darwin
+//go:build integration && (darwin || windows)
 
 package fyneui
 
@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"image"
 	"os"
@@ -32,7 +33,21 @@ import (
 
 // Only the developer test executable understands these environment variables.
 // TestMain, not a testing goroutine, owns the native application's main thread.
+var nativeGUIHelper func() error
+var nativeWindowChecks func(*testing.T, uint32, int, string)
+
 func TestMain(m *testing.M) {
+	if os.Getenv("RASTERDOCK_NATIVE_GUI_HELPER") == "1" {
+		if nativeGUIHelper == nil {
+			fmt.Fprintln(os.Stderr, "native GUI helper unavailable on this platform")
+			os.Exit(1)
+		}
+		if err := nativeGUIHelper(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	if os.Getenv("RASTERDOCK_NATIVE_TEST_VIEWER") == "1" {
 		if err := nativeTestViewer(); err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -117,7 +132,7 @@ func TestNativeVisualTransfer(t *testing.T) {
 		must(os.WriteFile(path, data, 0600))
 	}
 	must(os.MkdirAll(destination, 0700))
-	p, err := application.Prepare(ctx, source, filepath.Join(root, "sender"), 512, storage.Flush)
+	p, err := application.Prepare(ctx, source, filepath.Join(root, "sender"), 512, storage.Flush, root)
 	must(err)
 	// The viewer relies exclusively on the reopened immutable snapshot.
 	must(os.RemoveAll(source))
@@ -159,7 +174,7 @@ func TestNativeVisualTransfer(t *testing.T) {
 		}
 		for _, s := range sources {
 			// Sources prefixes the native title with the owning application.
-			if strings.HasSuffix(s.Title, " — "+title) {
+			if s.Title == title || strings.HasSuffix(s.Title, " — "+title) {
 				window = s.ID
 				break
 			}
@@ -192,9 +207,9 @@ func TestNativeVisualTransfer(t *testing.T) {
 		until := time.Now().Add(5 * time.Second)
 		var last error
 		for time.Now().Before(until) && ctx.Err() == nil {
-			frame, e := platform.Capture(window)
+			frame, e := nativeCaptureFrame(ctx, window)
 			if e != nil {
-				t.Fatalf("own-window ScreenCaptureKit capture: %v", e)
+				t.Fatalf("own-window native capture: %v", e)
 			}
 			if frame.CapturedAt.IsZero() {
 				t.Fatal("missing capture timestamp")
@@ -230,7 +245,7 @@ func TestNativeVisualTransfer(t *testing.T) {
 		b, packets := capture(n)
 		if receiver == nil {
 			descriptor = b.Descriptor
-			receiver, err = storage.OpenReceive(session, destination, descriptor, application.DecodeManifest)
+			receiver, err = storage.OpenReceive(session, destination, descriptor, application.DecodeManifest, root)
 			must(err)
 		}
 		must(receiver.CheckDescriptor(b.Descriptor))
@@ -261,7 +276,7 @@ func TestNativeVisualTransfer(t *testing.T) {
 	must(err)
 	must(receiver.Close())
 	receiver = nil
-	receiver, err = storage.OpenReceive(session, destination, descriptor, application.DecodeManifest)
+	receiver, err = storage.OpenReceive(session, destination, descriptor, application.DecodeManifest, root)
 	must(err)
 	after, err := receiver.DurableBytes()
 	must(err)
@@ -290,6 +305,32 @@ func TestNativeVisualTransfer(t *testing.T) {
 		}
 	}
 	t.Logf("restart durable bytes=%d; missing packet repaired; publication=%d/%d; all bytes/SHA256 verified", before, published, total)
+	if nativeWindowChecks != nil {
+		nativeWindowChecks(t, window, cmd.Process.Pid, title)
+	}
+}
+
+func nativeCaptureFrame(parent context.Context, id uint32) (frame platform.Frame, err error) {
+	stream, err := platform.OpenCapture(id)
+	if err != nil {
+		return frame, err
+	}
+	defer func() { err = errors.Join(err, stream.Close()) }()
+	ctx, cancel := context.WithTimeout(parent, 3*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for ctx.Err() == nil {
+		frame, err = stream.Next(ctx)
+		if !errors.Is(err, platform.ErrFramePending) {
+			return frame, err
+		}
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+		}
+	}
+	return platform.Frame{}, ctx.Err()
 }
 
 func TestNativeExactTranslationOracle(t *testing.T) {
