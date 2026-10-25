@@ -25,11 +25,11 @@ func TestReceiveResumeAndPublish(t *testing.T) {
 		t.Fatal(err)
 	}
 	dir := filepath.Join(state, "receiver")
-	r, err := storage.OpenReceive(dir, dest, p.Descriptor, application.DecodeManifest)
+	r, err := storage.OpenReceive(dir, dest, p.Descriptor, application.DecodeManifest, state)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if other, e := storage.OpenReceive(dir, dest, p.Descriptor, application.DecodeManifest); e == nil {
+	if other, e := storage.OpenReceive(dir, dest, p.Descriptor, application.DecodeManifest, state); e == nil {
 		_ = other.Close()
 		t.Fatal("two owners")
 	}
@@ -56,7 +56,7 @@ func TestReceiveResumeAndPublish(t *testing.T) {
 	if err = r.Close(); err != nil {
 		t.Fatal(err)
 	}
-	r, err = storage.OpenReceive(dir, dest, p.Descriptor, application.DecodeManifest)
+	r, err = storage.OpenReceive(dir, dest, p.Descriptor, application.DecodeManifest, state)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestFaultBeforeMetadataCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 	dir := filepath.Join(state, "receiver")
-	r, err := storage.OpenReceive(dir, dest, p.Descriptor, application.DecodeManifest)
+	r, err := storage.OpenReceive(dir, dest, p.Descriptor, application.DecodeManifest, state)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +118,7 @@ func TestFaultBeforeMetadataCommit(t *testing.T) {
 	if err = r.Close(); err != nil {
 		t.Fatal(err)
 	}
-	r, err = storage.OpenReceive(dir, dest, p.Descriptor, application.DecodeManifest)
+	r, err = storage.OpenReceive(dir, dest, p.Descriptor, application.DecodeManifest, state)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +152,7 @@ func TestPublicationRecoveryFaults(t *testing.T) {
 				t.Fatal(err)
 			}
 			dir := filepath.Join(state, "rx")
-			r, err := storage.OpenReceive(dir, dest, p.Descriptor, application.DecodeManifest)
+			r, err := storage.OpenReceive(dir, dest, p.Descriptor, application.DecodeManifest, state)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -177,7 +177,7 @@ func TestPublicationRecoveryFaults(t *testing.T) {
 			if err = r.Close(); err != nil {
 				t.Fatal(err)
 			}
-			r, err = storage.OpenReceive(dir, dest, p.Descriptor, application.DecodeManifest)
+			r, err = storage.OpenReceive(dir, dest, p.Descriptor, application.DecodeManifest, state)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -212,7 +212,7 @@ func TestReceiveCorruptionConflictAndDestinationSafety(t *testing.T) {
 		t.Fatal(err)
 	}
 	dir := filepath.Join(state, "rx")
-	r, err := storage.OpenReceive(dir, dest, p.Descriptor, application.DecodeManifest)
+	r, err := storage.OpenReceive(dir, dest, p.Descriptor, application.DecodeManifest, state)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -239,7 +239,7 @@ func TestReceiveCorruptionConflictAndDestinationSafety(t *testing.T) {
 	if err = os.WriteFile(filepath.Join(dir, "payload", "1.bin"), []byte("damaged!"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	r, err = storage.OpenReceive(dir, dest, p.Descriptor, application.DecodeManifest)
+	r, err = storage.OpenReceive(dir, dest, p.Descriptor, application.DecodeManifest, state)
 	if err != nil {
 		t.Fatal(err)
 	}

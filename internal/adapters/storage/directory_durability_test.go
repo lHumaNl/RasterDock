@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"testing"
 
@@ -32,7 +33,7 @@ func TestReceiveAnchorsWholeDirectoryHierarchy(t *testing.T) {
 	r, err := openReceive(session, t.TempDir(), directoryDescriptor(t), noManifestYet, func(name string) error {
 		synced = append(synced, name)
 		return SyncDir(name)
-	})
+	}, base)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,13 +41,13 @@ func TestReceiveAnchorsWholeDirectoryHierarchy(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Each entry is anchored by its parent, including the newly created config
-	// directory and every remaining ancestor to the filesystem root. Leaf-to-root
-	// order persists descendant content before parents.
+	// directory and every remaining ancestor to the filesystem root on Unix.
+	// Windows stops at the explicit caller-established base, inclusive.
 	for name := filepath.Join(session, "payload"); ; name = filepath.Dir(name) {
 		if !slices.Contains(synced, name) {
 			t.Fatalf("directory was never synced: %s; got %v", name, synced)
 		}
-		if filepath.Dir(name) == name {
+		if filepath.Dir(name) == name || (runtime.GOOS == "windows" && name == base) {
 			break
 		}
 	}
@@ -57,7 +58,7 @@ func TestReceiveAnchorsWholeDirectoryHierarchy(t *testing.T) {
 			t.Fatalf("not leaf-to-root: %v", synced)
 		}
 		previous = index
-		if filepath.Dir(name) == name {
+		if filepath.Dir(name) == name || (runtime.GOOS == "windows" && name == base) {
 			break
 		}
 	}
@@ -75,7 +76,7 @@ func TestReceiveAncestorSyncFailureBlocksInitializationAndRetryResyncs(t *testin
 			return injected
 		}
 		return SyncDir(name)
-	})
+	}, base)
 	if r != nil {
 		_ = r.Close()
 		t.Fatal("receiver returned despite ancestor durability failure")
@@ -94,7 +95,7 @@ func TestReceiveAncestorSyncFailureBlocksInitializationAndRetryResyncs(t *testin
 			called = true
 		}
 		return SyncDir(name)
-	})
+	}, base)
 	if err != nil {
 		t.Fatal(err)
 	}

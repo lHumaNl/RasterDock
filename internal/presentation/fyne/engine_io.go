@@ -27,10 +27,14 @@ type engineIO struct {
 	openReceive func(string, string, v1.Descriptor) (receiveOwner, error)
 }
 
-func openReceive(session, destination string, descriptor v1.Descriptor) (receiveOwner, error) {
-	r, err := storage.OpenReceive(session, destination, descriptor, application.DecodeManifest)
-	if err != nil {
-		return nil, err
+// anchoredReceive binds the engine's caller-established private state namespace.
+// Sessions outside that namespace are rejected, not assigned an inferred anchor.
+func anchoredReceive(anchor string) func(string, string, v1.Descriptor) (receiveOwner, error) {
+	return func(session, destination string, descriptor v1.Descriptor) (receiveOwner, error) {
+		r, err := storage.OpenReceive(session, destination, descriptor, application.DecodeManifest, anchor)
+		if err != nil {
+			return nil, err
+		}
+		return r, nil
 	}
-	return r, nil
 }

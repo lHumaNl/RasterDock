@@ -5,6 +5,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+
+	"rasterdock/internal/adapters/filesystem"
 )
 
 // WriteDurable creates a new immutable file and synchronizes its directory.
@@ -26,11 +28,7 @@ func WriteDurable(p string, b []byte) error {
 
 // SyncDir makes newly created or published names durable.
 func SyncDir(p string) error {
-	f, err := os.Open(p) //nolint:gosec // Caller-owned local state directory.
-	if err != nil {
-		return err
-	}
-	return errors.Join(f.Sync(), f.Close())
+	return filesystem.SyncDir(p)
 }
 
 // mkdirAllDurable anchors the complete directory chain before a receiver can

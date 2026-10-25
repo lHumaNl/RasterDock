@@ -52,7 +52,7 @@ func TestManifestRestorationReconcilesPublications(t *testing.T) {
 					}
 				}
 			}
-			r, err := storage.OpenReceive(session, dest, p.Descriptor, application.DecodeManifest)
+			r, err := storage.OpenReceive(session, dest, p.Descriptor, application.DecodeManifest, filepath.Dir(session))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -93,7 +93,7 @@ func TestManifestRestorationRetriesReconciliationFailure(t *testing.T) {
 	p, session, dest := publicationFixture(t)
 	faultPublication(t, p, session, dest, "publication-flushed")
 	loseManifestAndPayload(t, session)
-	r, err := storage.OpenReceive(session, dest, p.Descriptor, application.DecodeManifest)
+	r, err := storage.OpenReceive(session, dest, p.Descriptor, application.DecodeManifest, filepath.Dir(session))
 	if err != nil {
 		t.Fatal(err)
 	}

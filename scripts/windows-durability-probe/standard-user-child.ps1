@@ -2,10 +2,14 @@ param(
     [Parameter(Mandatory = $true)][string] $ProbePath,
     [Parameter(Mandatory = $true)][string] $ParentPath,
     [Parameter(Mandatory = $true)][string] $WorkPath,
-    [Parameter(Mandatory = $true)][string] $ReadyPath
+    [Parameter(Mandatory = $true)][string] $ReadyPath,
+    [string] $FilesystemTestPath,
+    [string] $StorageTestPath,
+    [string] $ApplicationTestPath
 )
 
 $ErrorActionPreference = 'Stop'
+$runTests = $false
 $result = [ordered]@{
     identity = $null
     identity_sid = $null
@@ -14,11 +18,62 @@ $result = [ordered]@{
     work_create_succeeded = $false
     probe_exit_code = $null
     probe_token_not_elevated = $false
+    test_count = 0
+    test_results = @()
     orphan_fixture_pid = $null
     errors = @()
 }
 $reportPath = Join-Path $WorkPath 'standard-user-report.json'
 $utf8 = [Text.UTF8Encoding]::new($false)
+
+function Invoke-ProductionTest([string] $Name, [string] $Executable) {
+    $stdoutPath = Join-Path $WorkPath ($Name + '-test.stdout.txt')
+    $stderrPath = Join-Path $WorkPath ($Name + '-test.stderr.txt')
+    # Precreate fixed log names so startup and timeout failures still leave artifacts.
+    [IO.File]::WriteAllText($stdoutPath, '', $utf8)
+    [IO.File]::WriteAllText($stderrPath, '', $utf8)
+    $start = [Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = $Executable
+    $start.Arguments = '-test.v -test.timeout=90s'
+    $start.WorkingDirectory = $WorkPath
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $testProcess = [Diagnostics.Process]::Start($start)
+    $stdout = $null
+    $stderr = $null
+    $timedOut = $false
+    try {
+        $stdout = $testProcess.StandardOutput.ReadToEndAsync()
+        $stderr = $testProcess.StandardError.ReadToEndAsync()
+        if (-not $testProcess.WaitForExit(110000)) {
+            $timedOut = $true
+            $testProcess.Kill()
+            if (-not $testProcess.WaitForExit(10000)) { throw "$Name test did not stop after timeout; owned job cleanup required." }
+        }
+        if (-not [Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($stdout, $stderr), 10000)) {
+            throw "$Name test output drain exceeded 10 seconds; owned job cleanup required."
+        }
+        return [pscustomobject]@{
+            name = $Name
+            exit_code = $testProcess.ExitCode
+            timed_out = $timedOut
+            stdout_log = [IO.Path]::GetFileName($stdoutPath)
+            stderr_log = [IO.Path]::GetFileName($stderrPath)
+        }
+    } finally {
+        # Windows PowerShell 5.1 uses .NET Framework: Task has Status but not
+        # the newer IsCompletedSuccessfully property.
+        if ($stdout -and $stdout.Status -eq [Threading.Tasks.TaskStatus]::RanToCompletion) { [IO.File]::WriteAllText($stdoutPath, $stdout.Result, $utf8) }
+        if ($stderr -and $stderr.Status -eq [Threading.Tasks.TaskStatus]::RanToCompletion) { [IO.File]::WriteAllText($stderrPath, $stderr.Result, $utf8) }
+        if (-not $testProcess.HasExited) {
+            $testProcess.Kill()
+            if (-not $testProcess.WaitForExit(10000)) { throw "$Name test still running after termination attempt." }
+        }
+        $testProcess.Dispose()
+    }
+}
 try {
     # Parent directory is read-only for this account. The controller creates the
     # per-run marker only after assigning this wrapper to its owned job. Never
@@ -32,6 +87,16 @@ try {
     $env:TEMP = $WorkPath
     $env:TMP = $WorkPath
     [Environment]::CurrentDirectory = $WorkPath
+    if ([bool]$StorageTestPath -ne [bool]$ApplicationTestPath -or [bool]$StorageTestPath -ne [bool]$FilesystemTestPath) { throw 'All three production test paths must be supplied together.' }
+    $runTests = [bool]$StorageTestPath
+    if ($runTests) {
+        $testsPath = Join-Path $ParentPath 'tests'
+        if (-not [string]::Equals([IO.Path]::GetFullPath($FilesystemTestPath), (Join-Path $testsPath 'filesystem.test.exe'), [StringComparison]::OrdinalIgnoreCase) -or
+            -not [string]::Equals([IO.Path]::GetFullPath($StorageTestPath), (Join-Path $testsPath 'storage.test.exe'), [StringComparison]::OrdinalIgnoreCase) -or
+            -not [string]::Equals([IO.Path]::GetFullPath($ApplicationTestPath), (Join-Path $testsPath 'application.test.exe'), [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Unexpected production test path; only controller-owned test executables are permitted.'
+        }
+    }
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = [Security.Principal.WindowsPrincipal]::new($identity)
     $result.identity = $identity.Name
@@ -105,6 +170,19 @@ try {
         }
         $process.Dispose()
     }
+    if ($runTests) {
+        $result.test_results += (Invoke-ProductionTest -Name 'filesystem' -Executable $FilesystemTestPath)
+        $result.test_count = $result.test_results.Count
+        $result.test_results += (Invoke-ProductionTest -Name 'storage' -Executable $StorageTestPath)
+        $result.test_count = $result.test_results.Count
+        $result.test_results += (Invoke-ProductionTest -Name 'application' -Executable $ApplicationTestPath)
+        $result.test_count = $result.test_results.Count
+        foreach ($test in $result.test_results) {
+            if ($test.timed_out -or $test.exit_code -ne 0) {
+                throw "Production tests failed: $($test.name) exit $($test.exit_code) timeout $($test.timed_out)."
+            }
+        }
+    }
     # Controlled cleanup regression: this process deliberately outlives the
     # wrapper, with inherited wrapper standard handles (NOT probe stream-drain
     # handles). The controller verifies membership using an opened process handle
@@ -127,5 +205,6 @@ try {
 } finally {
     [IO.File]::WriteAllText($reportPath, ($result | ConvertTo-Json -Depth 5), $utf8)
 }
-if ($result.errors.Count -gt 0 -or -not $result.parent_create_access_denied -or -not $result.work_create_succeeded -or -not $result.probe_token_not_elevated) { exit 1 }
+if ($result.errors.Count -gt 0 -or -not $result.parent_create_access_denied -or -not $result.work_create_succeeded -or -not $result.probe_token_not_elevated -or
+    ($runTests -and ($result.test_count -ne 3))) { exit 1 }
 exit 0

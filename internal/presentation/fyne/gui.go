@@ -194,7 +194,7 @@ func engine(ctx context.Context, root string, commands <-chan command, events ch
 	tick := time.NewTicker(200 * time.Millisecond)
 	defer tick.Stop()
 	runEngine(ctx, root, commands, events, logger, engineIO{
-		ticks: tick.C, capture: platform.Capture, decode: codec.Decode, openReceive: openReceive,
+		ticks: tick.C, capture: platform.Capture, decode: codec.Decode, openReceive: anchoredReceive(root),
 	})
 }
 
@@ -282,7 +282,7 @@ func runEngine(ctx context.Context, root string, commands <-chan command, events
 			switch cmd.kind {
 			case "prepare", "open":
 				if cmd.kind == "prepare" {
-					prepared, err = application.Prepare(ctx, cmd.source, filepath.Join(root, "state"), 512, storage.Flush)
+					prepared, err = application.Prepare(ctx, cmd.source, filepath.Join(root, "state"), 512, storage.Flush, root)
 				} else {
 					prepared, err = application.OpenPrepared(cmd.source)
 				}

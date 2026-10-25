@@ -13,10 +13,12 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 
 	"github.com/klauspost/compress/zstd"
 
+	"rasterdock/internal/adapters/filesystem"
 	"rasterdock/internal/domain"
 	v1 "rasterdock/internal/protocol/v1"
 )
@@ -30,9 +32,18 @@ type Prepared struct {
 
 // Prepare copies regular files, detects ordinary source changes and publishes a ready descriptor last.
 // The caller owns the engine and supplies its platform's durable flush operation.
-func Prepare(ctx context.Context, source, state string, block uint16, flush func(*os.File) error) (*Prepared, error) {
+// On Windows state (or the optional containing anchor) must be an established
+// private namespace. Its parent binding is outside this operation's boundary.
+func Prepare(ctx context.Context, source, state string, block uint16, flush func(*os.File) error, anchors ...string) (*Prepared, error) {
 	if block < 64 || block > 2048 {
 		return nil, v1.ErrPacket
+	}
+	if runtime.GOOS == "windows" {
+		var err error
+		state, err = filepath.Abs(state)
+		if err != nil {
+			return nil, err
+		}
 	}
 	source, err := filepath.Abs(source)
 	if err != nil {
@@ -81,7 +92,11 @@ func Prepare(ctx context.Context, source, state string, block uint16, flush func
 		return nil, err
 	}
 	dir := filepath.Join(state, "transfers", domain.IDString(id), "send", "prepared")
-	if err = os.MkdirAll(dir, 0700); err != nil {
+	boundary, err := preparationAnchor(state, anchors)
+	if err != nil {
+		return nil, err
+	}
+	if err = makePreparedDirectory(dir, boundary); err != nil {
 		return nil, err
 	}
 	p := &Prepared{Directory: dir, Descriptor: v1.Descriptor{Transfer: id, Block: block}, Manifest: domain.Manifest{TransferID: domain.IDString(id), BlockSize: block}}
@@ -144,7 +159,7 @@ func Prepare(ctx context.Context, source, state string, block uint16, flush func
 		if err = syncDirectory(path); err != nil {
 			return nil, err
 		}
-		if path == filepath.Clean(state) || filepath.Dir(path) == path {
+		if atPreparationBoundary(path, boundary) || filepath.Dir(path) == path {
 			break
 		}
 	}
@@ -233,11 +248,7 @@ func writeNew(path string, b []byte, flush func(*os.File) error) error {
 	return errors.Join(err, f.Close())
 }
 func syncDirectory(path string) error {
-	f, err := os.Open(path) //nolint:gosec // Synchronizing caller-owned sender state directory.
-	if err != nil {
-		return err
-	}
-	return errors.Join(f.Sync(), f.Close())
+	return filesystem.SyncDir(path)
 }
 
 // OpenPrepared revalidates descriptor and manifest; it never reads the original source.

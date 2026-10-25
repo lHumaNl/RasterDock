@@ -27,13 +27,13 @@ func TestDiscoveryExistingLiveAndClosedState(t *testing.T) {
 	}
 	session := filepath.Join(state, "transfers", domain.IDString(p.Descriptor.Transfer), "receive", domain.IDString(id))
 	dest := t.TempDir()
-	r, err := storage.OpenReceive(session, dest, p.Descriptor, application.DecodeManifest)
+	r, err := storage.OpenReceive(session, dest, p.Descriptor, application.DecodeManifest, state)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = r.Close() })
 	assertDiscovered(t, state, p.Directory, session, dest)
-	if other, e := storage.OpenReceive(session, dest, p.Descriptor, application.DecodeManifest); e == nil {
+	if other, e := storage.OpenReceive(session, dest, p.Descriptor, application.DecodeManifest, state); e == nil {
 		_ = other.Close()
 		t.Fatal("discovery stole ownership")
 	}
@@ -102,8 +102,8 @@ func TestDiscoveryCancellationAndEntryLimit(t *testing.T) {
 	}
 }
 
-func TestDiscoveryRejectsMalformedAndSymlinkDescriptor(t *testing.T) {
-	for _, kind := range []string{"malformed", "symlink", "directory"} {
+func TestDiscoveryRejectsMalformedAndLinkDescriptor(t *testing.T) {
+	for _, kind := range []string{"malformed", rejectionLinkKind, "directory"} {
 		t.Run(kind, func(t *testing.T) { testBadDescriptor(t, kind) })
 	}
 }
@@ -118,11 +118,12 @@ func testBadDescriptor(t *testing.T, kind string) {
 	if err := os.Remove(ready); err != nil {
 		t.Fatal(err)
 	}
+	var checkLink func()
 	switch kind {
 	case "malformed":
 		err = os.WriteFile(ready, []byte("broken"), 0600)
-	case "symlink":
-		err = os.Symlink(filepath.Join(p.Directory, "manifest.zst"), ready)
+	case rejectionLinkKind:
+		checkLink = rejectionLink(t, ready, false)
 	case "directory":
 		err = os.Mkdir(ready, 0700)
 	}
@@ -133,18 +134,20 @@ func testBadDescriptor(t *testing.T, kind string) {
 	if err != nil || len(got.Senders) != 0 || len(got.Issues) != 1 {
 		t.Fatalf("bad descriptor accepted: %+v, %v", got, err)
 	}
+	if checkLink != nil {
+		checkLink()
+	}
 }
 
-func TestDiscoveryMissingAndSymlinkRoot(t *testing.T) {
+func TestDiscoveryMissingAndLinkRoot(t *testing.T) {
 	state := t.TempDir()
 	got, err := storage.Discover(t.Context(), state)
 	if err != nil || len(got.Senders) != 0 {
 		t.Fatalf("empty: %+v %v", got, err)
 	}
-	if err := os.Symlink(t.TempDir(), filepath.Join(state, "transfers")); err != nil {
-		t.Fatal(err)
-	}
+	checkLink := rejectionLink(t, filepath.Join(state, "transfers"), true)
 	if _, err := storage.Discover(t.Context(), state); err == nil {
-		t.Fatal("followed symlink")
+		t.Fatalf("followed %s", rejectionLinkKind)
 	}
+	checkLink()
 }

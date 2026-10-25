@@ -1,6 +1,9 @@
 param(
     [Parameter(Mandatory = $true)][string] $ProbePath,
-    [Parameter(Mandatory = $true)][string] $ArtifactDirectory
+    [Parameter(Mandatory = $true)][string] $ArtifactDirectory,
+    [string] $FilesystemTestPath,
+    [string] $StorageTestPath,
+    [string] $ApplicationTestPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -21,11 +24,16 @@ $jobActiveBeforeCleanup = $null
 $jobActiveAfterCleanup = $null
 $jobTerminated = $false
 $utf8 = [Text.UTF8Encoding]::new($false)
+$runTests = $false
 [IO.Directory]::CreateDirectory($ArtifactDirectory) | Out-Null
 
 function Set-OwnedAcl([string] $Path, [Security.Principal.SecurityIdentifier] $UserSid, [string] $UserRights) {
     $acl = Get-Acl -LiteralPath $Path
     $acl.SetAccessRuleProtection($true, $false)
+    $inheritance = [Security.AccessControl.InheritanceFlags]::None
+    if (Test-Path -LiteralPath $Path -PathType Container) {
+        $inheritance = [Security.AccessControl.InheritanceFlags] 'ContainerInherit, ObjectInherit'
+    }
     foreach ($entry in @(
         [pscustomobject]@{ Sid = 'S-1-5-18'; Rights = 'FullControl' },     # SYSTEM
         [pscustomobject]@{ Sid = 'S-1-5-32-544'; Rights = 'FullControl' }, # built-in Administrators
@@ -34,7 +42,7 @@ function Set-OwnedAcl([string] $Path, [Security.Principal.SecurityIdentifier] $U
         $sid = [Security.Principal.SecurityIdentifier]::new($entry.Sid)
         $rule = [Security.AccessControl.FileSystemAccessRule]::new(
             $sid, [Security.AccessControl.FileSystemRights]$entry.Rights,
-            [Security.AccessControl.InheritanceFlags] 'ContainerInherit, ObjectInherit',
+            $inheritance,
             [Security.AccessControl.PropagationFlags]::None,
             [Security.AccessControl.AccessControlType]::Allow)
         $acl.AddAccessRule($rule)
@@ -44,6 +52,18 @@ function Set-OwnedAcl([string] $Path, [Security.Principal.SecurityIdentifier] $U
 
 try {
     if (-not (Test-Path -LiteralPath $ProbePath -PathType Leaf)) { throw 'Diagnostic executable not found.' }
+    if ([bool]$StorageTestPath -ne [bool]$ApplicationTestPath -or [bool]$StorageTestPath -ne [bool]$FilesystemTestPath) { throw 'All three production test paths must be supplied together.' }
+    $runTests = [bool]$StorageTestPath
+    if ($runTests) {
+        if ([IO.Path]::GetFileName($FilesystemTestPath) -cne 'filesystem.test.exe' -or
+            [IO.Path]::GetFileName($StorageTestPath) -cne 'storage.test.exe' -or
+            [IO.Path]::GetFileName($ApplicationTestPath) -cne 'application.test.exe') {
+            throw 'Unexpected production test executable name.'
+        }
+        if (-not (Test-Path -LiteralPath $FilesystemTestPath -PathType Leaf) -or
+            -not (Test-Path -LiteralPath $StorageTestPath -PathType Leaf) -or
+            -not (Test-Path -LiteralPath $ApplicationTestPath -PathType Leaf)) { throw 'Production test executable missing.' }
+    }
     $id = [guid]::NewGuid().ToString('N')
     $userName = 'rdp' + $id.Substring(0, 12)
     $root = Join-Path $env:ProgramData ('rasterdock-probe-' + $id)
@@ -55,6 +75,13 @@ try {
     New-Item -Path $work -ItemType Directory -ErrorAction Stop | Out-Null
     Copy-Item -LiteralPath $ProbePath -Destination (Join-Path $root 'probe.exe') -ErrorAction Stop
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'standard-user-child.ps1') -Destination (Join-Path $root 'standard-user-child.ps1') -ErrorAction Stop
+    if ($runTests) {
+        $tests = Join-Path $root 'tests'
+        New-Item -Path $tests -ItemType Directory -ErrorAction Stop | Out-Null
+        Copy-Item -LiteralPath $FilesystemTestPath -Destination (Join-Path $tests 'filesystem.test.exe') -ErrorAction Stop
+        Copy-Item -LiteralPath $StorageTestPath -Destination (Join-Path $tests 'storage.test.exe') -ErrorAction Stop
+        Copy-Item -LiteralPath $ApplicationTestPath -Destination (Join-Path $tests 'application.test.exe') -ErrorAction Stop
+    }
 
     $random = New-Object byte[] 32
     [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($random)
@@ -72,6 +99,12 @@ try {
     }
     Set-OwnedAcl $root $userSid 'ReadAndExecute'
     Set-OwnedAcl $work $userSid 'Modify'
+    if ($runTests) {
+        Set-OwnedAcl $tests $userSid 'ReadAndExecute'
+        Set-OwnedAcl (Join-Path $tests 'filesystem.test.exe') $userSid 'ReadAndExecute'
+        Set-OwnedAcl (Join-Path $tests 'storage.test.exe') $userSid 'ReadAndExecute'
+        Set-OwnedAcl (Join-Path $tests 'application.test.exe') $userSid 'ReadAndExecute'
+    }
 
     . (Join-Path $PSScriptRoot 'job-object.ps1')
     $job = [RasterDockProbeJob]::Create()
@@ -81,6 +114,9 @@ try {
     $script = Join-Path $root 'standard-user-child.ps1'
     $readyPath = Join-Path $root ('ready-' + [guid]::NewGuid().ToString('N'))
     $argsLine = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -ProbePath "{1}" -ParentPath "{2}" -WorkPath "{3}" -ReadyPath "{4}"' -f $script, (Join-Path $root 'probe.exe'), $root, $work, $readyPath
+    if ($runTests) {
+        $argsLine += ' -StorageTestPath "{0}" -ApplicationTestPath "{1}" -FilesystemTestPath "{2}"' -f (Join-Path $tests 'storage.test.exe'), (Join-Path $tests 'application.test.exe'), (Join-Path $tests 'filesystem.test.exe')
+    }
     $process = Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
         -Credential $credential -ArgumentList $argsLine -WorkingDirectory $work -PassThru `
         -RedirectStandardOutput (Join-Path $work 'child.stdout.txt') `
@@ -94,7 +130,7 @@ try {
     # Read the report while the controlled fixture is still alive, using an
     # opened handle for the membership check rather than acting on a stale PID.
     $reportPath = Join-Path $work 'standard-user-report.json'
-    $reportDeadline = [datetime]::UtcNow.AddSeconds(340)
+    $reportDeadline = [datetime]::UtcNow.AddSeconds(660)
     while (-not [IO.File]::Exists($reportPath)) {
         if ([datetime]::UtcNow -ge $reportDeadline -or $process.HasExited) { throw 'Wrapper did not publish a report in time.' }
         Start-Sleep -Milliseconds 100
@@ -107,6 +143,30 @@ try {
             Start-Sleep -Milliseconds 100
         }
     }
+    if (@($childReport.errors).Count -gt 0 -and $childReport.errors) {
+        throw "Standard-user child: $($childReport.errors -join '; ')"
+    }
+    if ($runTests) {
+        $testResults = @($childReport.test_results)
+        if ($childReport.test_count -ne 3 -or $testResults.Count -ne 3) {
+            throw 'Expected three production standard-user test results.'
+        }
+        $expectedTests = @('filesystem', 'storage', 'application')
+        for ($i = 0; $i -lt $expectedTests.Count; $i++) {
+            $name = $expectedTests[$i]
+            $test = $testResults[$i]
+            if ($test.name -cne $name -or $null -eq $test.exit_code -or $test.exit_code -ne 0 -or
+                $test.timed_out -isnot [bool] -or $test.timed_out -ne $false -or
+                $test.stdout_log -cne ($name + '-test.stdout.txt') -or $test.stderr_log -cne ($name + '-test.stderr.txt')) {
+                throw "Production standard-user test result missing or failed: $name"
+            }
+        }
+        foreach ($name in @('filesystem-test.stdout.txt', 'filesystem-test.stderr.txt', 'storage-test.stdout.txt', 'storage-test.stderr.txt', 'application-test.stdout.txt', 'application-test.stderr.txt')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $work $name) -PathType Leaf)) {
+                throw "Production test log missing: $name"
+            }
+        }
+    }
     $orphanFixtureId = $childReport.orphan_fixture_pid
     if ($orphanFixtureId -and $orphanFixtureId -match '^\d+$' -and [uint64]$orphanFixtureId -le [uint32]::MaxValue) {
         $fixtureInJob = $job.ContainsPid([uint32]$orphanFixtureId)
@@ -114,8 +174,8 @@ try {
     if (-not $fixtureInJob) { throw 'Controlled orphan fixture was not observed in the owned job.' }
     $jobActiveBeforeCleanup = $job.ActiveProcesses()
     if ($jobActiveBeforeCleanup -lt 1) { throw 'Owned job was empty before fixture cleanup.' }
-    if (-not $process.WaitForExit(360000)) {
-        throw 'Standard-user wrapper exceeded 360 seconds; job cleanup follows.'
+    if (-not $process.WaitForExit(15000)) {
+        throw 'Standard-user wrapper did not exit within 15 seconds after publishing its final report; job cleanup follows.'
     }
     $jobActiveBeforeCleanup = $job.ActiveProcesses()
     if ($jobActiveBeforeCleanup -lt 1) { throw 'No owned job process survived wrapper exit for cleanup.' }
@@ -156,7 +216,7 @@ try {
         finally { $process.Dispose() }
     }
     if ($work -and (Test-Path -LiteralPath $work)) {
-        foreach ($name in @('probe.json', 'probe.stderr.txt', 'standard-user-report.json', 'child.stdout.txt', 'child.stderr.txt')) {
+        foreach ($name in @('probe.json', 'probe.stderr.txt', 'standard-user-report.json', 'child.stdout.txt', 'child.stderr.txt', 'filesystem-test.stdout.txt', 'filesystem-test.stderr.txt', 'storage-test.stdout.txt', 'storage-test.stderr.txt', 'application-test.stdout.txt', 'application-test.stderr.txt')) {
             try {
                 $source = Join-Path $work $name
                 if (Test-Path -LiteralPath $source -PathType Leaf) {

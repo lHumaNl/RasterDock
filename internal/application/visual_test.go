@@ -27,7 +27,7 @@ func TestVisualTransferWithLossAndRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, err := storage.OpenReceive(filepath.Join(state, "rx"), dest, p.Descriptor, application.DecodeManifest)
+	r, err := storage.OpenReceive(filepath.Join(state, "rx"), dest, p.Descriptor, application.DecodeManifest, state)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +72,7 @@ func TestVisualTransferWithLossAndRestart(t *testing.T) {
 	if err = r.Close(); err != nil {
 		t.Fatal(err)
 	}
-	r, err = storage.OpenReceive(filepath.Join(state, "rx"), dest, p.Descriptor, application.DecodeManifest)
+	r, err = storage.OpenReceive(filepath.Join(state, "rx"), dest, p.Descriptor, application.DecodeManifest, state)
 	if err != nil {
 		t.Fatal(err)
 	}

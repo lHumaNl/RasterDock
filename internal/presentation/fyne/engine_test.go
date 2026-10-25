@@ -23,6 +23,15 @@ const payloadText = "receiver ownership regression"
 
 var errInjected = errors.New("injected receive failure")
 
+func TestAnchoredReceiveRejectsSessionOutsideEngineNamespace(t *testing.T) {
+	p := prepareFixture(t)
+	open := anchoredReceive(t.TempDir())
+	r, err := open(t.TempDir(), t.TempDir(), p.Descriptor)
+	if r != nil || !errors.Is(err, storage.ErrNamespace) {
+		t.Fatalf("session outside engine namespace accepted: %v", err)
+	}
+}
+
 type observedReceiver struct {
 	receiveOwner
 	fault  *string
@@ -125,7 +134,7 @@ func (h *engineHarness) decode(image.Image) (v1.Beacon, []v1.Packet, error) {
 }
 
 func (h *engineHarness) open(session, destination string, d v1.Descriptor) (receiveOwner, error) {
-	r, err := openReceive(session, destination, d)
+	r, err := anchoredReceive(session)(session, destination, d)
 	if err != nil {
 		return nil, err
 	}
@@ -191,7 +200,7 @@ func (h *engineHarness) assertReleased(cmd command) {
 	if h.owners[0].closes != 1 {
 		h.t.Errorf("old receiver closed %d times, want 1", h.owners[0].closes)
 	}
-	r, err := openReceive(cmd.session, cmd.destination, h.prepared.Descriptor)
+	r, err := anchoredReceive(cmd.session)(cmd.session, cmd.destination, h.prepared.Descriptor)
 	if err != nil {
 		h.t.Errorf("old session lock not released: %v", err)
 		return

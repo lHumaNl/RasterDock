@@ -32,7 +32,7 @@ func publicationFixture(t *testing.T) (*application.Prepared, string, string) {
 		t.Fatal(err)
 	}
 	session := filepath.Join(base, "rx")
-	r, err := storage.OpenReceive(session, dest, p.Descriptor, application.DecodeManifest)
+	r, err := storage.OpenReceive(session, dest, p.Descriptor, application.DecodeManifest, base)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +53,7 @@ func publicationFixture(t *testing.T) (*application.Prepared, string, string) {
 
 func faultPublication(t *testing.T, p *application.Prepared, session, dest, stage string) {
 	t.Helper()
-	r, err := storage.OpenReceive(session, dest, p.Descriptor, application.DecodeManifest)
+	r, err := storage.OpenReceive(session, dest, p.Descriptor, application.DecodeManifest, filepath.Dir(session))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +78,7 @@ func TestPublicationReusesVerifiedTempWithoutPayload(t *testing.T) {
 	if err := os.Remove(filepath.Join(session, "payload", "1.bin")); err != nil {
 		t.Fatal(err)
 	}
-	r, err := storage.OpenReceive(session, dest, p.Descriptor, application.DecodeManifest)
+	r, err := storage.OpenReceive(session, dest, p.Descriptor, application.DecodeManifest, filepath.Dir(session))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +107,7 @@ func TestPublicationPreservesReplacedTemp(t *testing.T) {
 	if err = os.WriteFile(names[0], []byte("unrelated"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	r, err := storage.OpenReceive(session, dest, p.Descriptor, application.DecodeManifest)
+	r, err := storage.OpenReceive(session, dest, p.Descriptor, application.DecodeManifest, filepath.Dir(session))
 	if r != nil {
 		if e := r.Close(); e != nil {
 			t.Error(e)
@@ -124,7 +124,7 @@ func TestPublicationPreservesReplacedTemp(t *testing.T) {
 
 func TestPublicationAssemblyFailureTracksTemp(t *testing.T) {
 	p, session, dest := publicationFixture(t)
-	r, err := storage.OpenReceive(session, dest, p.Descriptor, application.DecodeManifest)
+	r, err := storage.OpenReceive(session, dest, p.Descriptor, application.DecodeManifest, filepath.Dir(session))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ func TestPublicationAssemblyFailureTracksTemp(t *testing.T) {
 	if err = os.WriteFile(payload, []byte("verified"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	r, err = storage.OpenReceive(session, dest, p.Descriptor, application.DecodeManifest)
+	r, err = storage.OpenReceive(session, dest, p.Descriptor, application.DecodeManifest, filepath.Dir(session))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +164,7 @@ func TestPublicationUntrackedTempIsNotDeleted(t *testing.T) {
 		t.Fatal(err)
 	}
 	faultPublication(t, p, session, dest, "publication-flushed")
-	r, err := storage.OpenReceive(session, dest, p.Descriptor, application.DecodeManifest)
+	r, err := storage.OpenReceive(session, dest, p.Descriptor, application.DecodeManifest, filepath.Dir(session))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +177,7 @@ func TestPublicationUntrackedTempIsNotDeleted(t *testing.T) {
 	}
 }
 
-func TestPublicationSymlinkTempRejected(t *testing.T) {
+func TestPublicationLinkTempRejected(t *testing.T) {
 	p, session, dest := publicationFixture(t)
 	faultPublication(t, p, session, dest, "publication-flushed")
 	names, err := filepath.Glob(filepath.Join(dest, ".rasterdock-*.tmp"))
@@ -188,20 +188,19 @@ func TestPublicationSymlinkTempRejected(t *testing.T) {
 	if err = os.Rename(names[0], retained); err != nil {
 		t.Fatal(err)
 	}
-	if err = os.Symlink("retained", names[0]); err != nil {
-		t.Fatal(err)
-	}
-	r, err := storage.OpenReceive(session, dest, p.Descriptor, application.DecodeManifest)
+	checkLink := rejectionLink(t, names[0], false)
+	r, err := storage.OpenReceive(session, dest, p.Descriptor, application.DecodeManifest, filepath.Dir(session))
 	if r != nil {
 		if e := r.Close(); e != nil {
 			t.Error(e)
 		}
 	}
 	if !errors.Is(err, storage.ErrConflict) {
-		t.Fatalf("symlink accepted: %v", err)
+		t.Fatalf("%s accepted: %v", rejectionLinkKind, err)
 	}
-	if target, e := os.Readlink(names[0]); e != nil || target != "retained" {
-		t.Fatal("link changed", e)
+	checkLink()
+	if data, e := os.ReadFile(retained); e != nil || string(data) != "verified" { //nolint:gosec // Test-owned retained publication temp.
+		t.Fatal("retained temp changed", e)
 	}
 }
 
@@ -221,7 +220,7 @@ func TestPublicationClearsStalePublishedBeforeTempConflict(t *testing.T) {
 	if err = os.Remove(filepath.Join(dest, "a")); err != nil {
 		t.Fatal(err)
 	}
-	r, err := storage.OpenReceive(session, dest, p.Descriptor, application.DecodeManifest)
+	r, err := storage.OpenReceive(session, dest, p.Descriptor, application.DecodeManifest, filepath.Dir(session))
 	if r != nil {
 		if e := r.Close(); e != nil {
 			t.Error(e)
@@ -261,7 +260,7 @@ func TestPublicationRejectsCorruptIntent(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			r, err := storage.OpenReceive(session, dest, p.Descriptor, application.DecodeManifest)
+			r, err := storage.OpenReceive(session, dest, p.Descriptor, application.DecodeManifest, filepath.Dir(session))
 			if r != nil {
 				if e := r.Close(); e != nil {
 					t.Error(e)
@@ -295,7 +294,7 @@ func TestPublicationMissingOrCorruptTempRebuilt(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			r, err := storage.OpenReceive(session, dest, p.Descriptor, application.DecodeManifest)
+			r, err := storage.OpenReceive(session, dest, p.Descriptor, application.DecodeManifest, filepath.Dir(session))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -334,7 +333,7 @@ func TestPublicationProcessCrash(t *testing.T) {
 			if !errors.As(err, &exit) || exit.ExitCode() != 77 {
 				t.Fatalf("child did not crash at requested boundary: %v %s", err, output)
 			}
-			r, err := storage.OpenReceive(session, dest, p.Descriptor, application.DecodeManifest)
+			r, err := storage.OpenReceive(session, dest, p.Descriptor, application.DecodeManifest, filepath.Dir(session))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -365,7 +364,7 @@ func TestPublicationCrashChild(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, err := storage.OpenReceive(os.Getenv("RD_SESSION"), os.Getenv("RD_DEST"), p.Descriptor, application.DecodeManifest)
+	r, err := storage.OpenReceive(os.Getenv("RD_SESSION"), os.Getenv("RD_DEST"), p.Descriptor, application.DecodeManifest, filepath.Dir(os.Getenv("RD_SESSION")))
 	if err != nil {
 		t.Fatal(err)
 	}

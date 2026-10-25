@@ -1,4 +1,4 @@
-name: Windows storage API diagnostic (not durability acceptance)
+name: Windows storage standard-user tests and API diagnostic (not durability acceptance)
 on:
   workflow_dispatch:
 permissions:
@@ -9,7 +9,7 @@ env:
 jobs:
   observe:
     runs-on: windows-2022
-    timeout-minutes: 15
+    timeout-minutes: 25
     defaults:
       run:
         shell: powershell
@@ -22,8 +22,20 @@ jobs:
         run: go test -count=1 ./scripts/windows-durability-probe
       - name: Build diagnostic (no elevated execution)
         run: go build -o "$env:RUNNER_TEMP\windows-durability-probe.exe" ./scripts/windows-durability-probe
+      - name: Compile filesystem, storage and application test executables (CGO)
+        run: |
+          $env:CGO_ENABLED = '1'
+          if ((go env GOTOOLCHAIN) -ne 'local' -or (go env CGO_ENABLED) -ne '1') { throw 'Expected local Go toolchain with CGO enabled.' }
+          $cc = go env CC
+          if (-not (Get-Command $cc -ErrorAction SilentlyContinue)) { throw "CGO C compiler unavailable: $cc" }
+          go test -c -o "$env:RUNNER_TEMP\filesystem.test.exe" ./internal/adapters/filesystem
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath "$env:RUNNER_TEMP\filesystem.test.exe" -PathType Leaf)) { throw 'Filesystem test compilation failed.' }
+          go test -c -o "$env:RUNNER_TEMP\storage.test.exe" ./internal/adapters/storage
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath "$env:RUNNER_TEMP\storage.test.exe" -PathType Leaf)) { throw 'Storage test compilation failed.' }
+          go test -c -o "$env:RUNNER_TEMP\application.test.exe" ./internal/application
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath "$env:RUNNER_TEMP\application.test.exe" -PathType Leaf)) { throw 'Application test compilation failed.' }
       - name: Observe APIs under temporary standard local account
-        run: ./scripts/windows-durability-probe/run-standard-user.ps1 -ProbePath "$env:RUNNER_TEMP\windows-durability-probe.exe" -ArtifactDirectory "$env:GITHUB_WORKSPACE\windows-durability-observations"
+        run: ./scripts/windows-durability-probe/run-standard-user.ps1 -ProbePath "$env:RUNNER_TEMP\windows-durability-probe.exe" -FilesystemTestPath "$env:RUNNER_TEMP\filesystem.test.exe" -StorageTestPath "$env:RUNNER_TEMP\storage.test.exe" -ApplicationTestPath "$env:RUNNER_TEMP\application.test.exe" -ArtifactDirectory "$env:GITHUB_WORKSPACE\windows-durability-observations"
       - name: Retain observations and bootstrap errors even on failure
         if: always()
         uses: actions/upload-artifact@v4.6.2
