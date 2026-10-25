@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"io"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -66,8 +65,7 @@ func (r contextReader) Read(p []byte) (int, error) {
 }
 
 func queryReceiveSummary(ctx context.Context, path, transfer string) (string, error) {
-	uri := url.URL{Scheme: "file", Path: path, RawQuery: "mode=ro&_query_only=1"}
-	db, err := sql.Open("sqlite3", uri.String())
+	db, err := sql.Open("sqlite3", sqliteDSN(path, discoverySQLiteOptions))
 	if err != nil {
 		return "", err
 	}

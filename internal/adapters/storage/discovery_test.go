@@ -40,13 +40,22 @@ func TestDiscoveryExistingLiveAndClosedState(t *testing.T) {
 	if err := r.Close(); err != nil {
 		t.Fatal(err)
 	}
+	lockBytes, err := os.ReadFile(filepath.Join(session, "owner.lock")) //nolint:gosec // Test-owned session.
+	if err != nil || len(lockBytes) != 0 {
+		t.Fatalf("released owner lock: bytes=%d error=%v", len(lockBytes), err)
+	}
 	assertDiscovered(t, state, p.Directory, session, dest)
 }
 
 func assertDiscovered(t *testing.T, state, sender, session, dest string) {
 	t.Helper()
+	lockBefore := emptyOwnerLock(t, session)
 	before := sessionFiles(t, session)
 	got, err := storage.Discover(t.Context(), state)
+	lockAfter := emptyOwnerLock(t, session)
+	if !os.SameFile(lockBefore, lockAfter) || !lockBefore.ModTime().Equal(lockAfter.ModTime()) {
+		t.Fatal("discovery replaced or modified owner lock")
+	}
 	if !reflect.DeepEqual(before, sessionFiles(t, session)) {
 		t.Fatal("discovery changed original session files")
 	}
@@ -72,6 +81,14 @@ func sessionFiles(t *testing.T, session string) map[string][32]byte {
 		if entry.IsDir() {
 			continue
 		}
+		if entry.Name() == "owner.lock" {
+			// Windows mandatory range locks prevent ReadFile even at EOF.
+			// A regular zero-length file has no bytes to hash; still require
+			// its presence, size and identity, and verify ownership separately.
+			emptyOwnerLock(t, session)
+			result[entry.Name()] = sha256.Sum256(nil)
+			continue
+		}
 		data, err := os.ReadFile(filepath.Join(session, entry.Name())) //nolint:gosec // Test-owned session directory, never real user state.
 		if err != nil {
 			t.Fatal(err)
@@ -79,6 +96,57 @@ func sessionFiles(t *testing.T, session string) map[string][32]byte {
 		result[entry.Name()] = sha256.Sum256(data)
 	}
 	return result
+}
+
+func emptyOwnerLock(t *testing.T, session string) os.FileInfo {
+	t.Helper()
+	info, err := os.Lstat(filepath.Join(session, "owner.lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Mode().IsRegular() || info.Size() != 0 {
+		t.Fatalf("owner lock must remain a regular empty file: %v", info)
+	}
+	// Windows Lstat can defer file-ID lookup until SameFile. Capture it from
+	// a handle now, before discovery could replace the pathname. No byte read
+	// is necessary, so this also works while the mandatory range lock is held.
+	f, err := os.Open(filepath.Join(session, "owner.lock")) //nolint:gosec // Test-owned session.
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, statErr := f.Stat()
+	if err := errors.Join(statErr, f.Close()); err != nil {
+		t.Fatal(err)
+	}
+	if !opened.Mode().IsRegular() || opened.Size() != 0 {
+		t.Fatal("opened owner lock is not a regular empty file")
+	}
+	return opened
+}
+
+func TestOwnerLockSnapshotCapturesIdentityBeforeReplacement(t *testing.T) {
+	session := t.TempDir()
+	name := filepath.Join(session, "owner.lock")
+	if err := os.WriteFile(name, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	before := emptyOwnerLock(t, session)
+	if err := os.Rename(name, filepath.Join(session, "retained.lock")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(name, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(name, before.ModTime(), before.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	after := emptyOwnerLock(t, session)
+	if !before.ModTime().Equal(after.ModTime()) {
+		t.Fatal("fixture did not preserve modification time")
+	}
+	if os.SameFile(before, after) {
+		t.Fatal("snapshot followed the replaced pathname instead of preserving identity")
+	}
 }
 
 func TestDiscoveryCancellationAndEntryLimit(t *testing.T) {

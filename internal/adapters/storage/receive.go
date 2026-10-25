@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -79,8 +78,7 @@ func openReceive(dir, destination string, d v1.Descriptor, decode func(io.Reader
 			_ = r.Close()
 		}
 	}()
-	u := url.URL{Scheme: "file", Path: filepath.Join(dir, "state.sqlite"), RawQuery: "_journal_mode=WAL&_synchronous=FULL&_foreign_keys=on&_busy_timeout=5000&_cache_size=-2048"}
-	r.db, err = sql.Open("sqlite3", u.String())
+	r.db, err = sql.Open("sqlite3", sqliteDSN(filepath.Join(dir, "state.sqlite"), receiveSQLiteOptions))
 	if err != nil {
 		return nil, err
 	}

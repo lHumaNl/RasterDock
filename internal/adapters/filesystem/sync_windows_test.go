@@ -89,8 +89,15 @@ func TestSyncKeepsPinnedObjectAfterNameReplacement(t *testing.T) {
 	f, err = root.Open("original")
 	requireNoError(t, err)
 	defer func() { requireNoError(t, f.Close()) }()
+	want, err := f.Stat()
+	requireNoError(t, err)
 	requireNoError(t, root.Rename("original", "retained"))
 	// The old name is absent, so reopening by File.Name cannot succeed.
+	requireNoError(t, Sync(f))
+	replacement, err := root.Create("original")
+	requireNoError(t, err)
+	requireNoError(t, replacement.Close())
+	assertReopenedIdentity(t, f, want)
 	requireNoError(t, Sync(f))
 }
 
@@ -122,7 +129,12 @@ func TestSyncDirectoryKeepsPinnedObjectAfterNameReplacement(t *testing.T) {
 	requireNoError(t, err)
 	requireNoError(t, root.Rename("original", "retained"))
 	requireNoError(t, root.Mkdir("original", 0700))
+	assertReopenedIdentity(t, f, want)
+	requireNoError(t, Sync(f))
+}
 
+func assertReopenedIdentity(t *testing.T, f *os.File, want os.FileInfo) {
+	t.Helper()
 	// Success alone cannot detect flushing the replacement directory. Compare
 	// the reopened handle's identity with the original pinned object as well.
 	raw, err := f.SyscallConn()
@@ -133,14 +145,38 @@ func TestSyncDirectoryKeepsPinnedObjectAfterNameReplacement(t *testing.T) {
 		reopened, reopenErr = reopenWritable(windows.Handle(handle))
 	}))
 	requireNoError(t, reopenErr)
-	reopenedFile := os.NewFile(uintptr(reopened), "pinned-directory-test")
+	reopenedFile := os.NewFile(uintptr(reopened), "pinned-object-test")
 	defer func() { requireNoError(t, reopenedFile.Close()) }()
 	got, err := reopenedFile.Stat()
 	requireNoError(t, err)
 	if !os.SameFile(want, got) {
-		t.Fatal("write reopening selected a different directory")
+		t.Fatal("write reopening selected a different object")
 	}
-	requireNoError(t, Sync(f))
+}
+
+func TestSyncDirectoryPropagatesACLDenial(t *testing.T) {
+	dir := t.TempDir()
+	f, err := os.Open(dir) //nolint:gosec // Test-owned directory.
+	requireNoError(t, err)
+	defer func() { requireNoError(t, f.Close()) }()
+	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+	requireNoError(t, err)
+	sid := user.User.Sid.String()
+	t.Cleanup(func() { setDirectoryTestACL(t, dir, "D:P(A;OICI;FA;;;"+sid+")") })
+	setDirectoryTestACL(t, dir, "D:P(A;;GRGX;;;"+sid+")")
+	if err = Sync(f); !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		t.Fatalf("directory write reopening ACL error: %v", err)
+	}
+}
+
+func setDirectoryTestACL(t *testing.T, dir, sddl string) {
+	t.Helper()
+	sd, err := windows.SecurityDescriptorFromString(sddl)
+	requireNoError(t, err)
+	dacl, _, err := sd.DACL()
+	requireNoError(t, err)
+	requireNoError(t, windows.SetNamedSecurityInfo(dir, windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil))
 }
 
 func TestSyncDirectoryPropagatesSharingViolation(t *testing.T) {
@@ -170,6 +206,10 @@ func TestClosedRawControlErrorIsNotNormalizedByGo(t *testing.T) {
 	// Log typed evidence rather than matching the internal poll error's text.
 	t.Logf("RawConn.Control: %T %v; matches os.ErrClosed=%v",
 		controlErr, controlErr, errors.Is(controlErr, os.ErrClosed))
+	normalized := normalizeControlError(f, controlErr)
+	if !errors.Is(normalized, controlErr) || !errors.Is(normalized, os.ErrClosed) {
+		t.Fatalf("normalization must retain both causes: %v", normalized)
+	}
 	if err := f.Sync(); !errors.Is(err, os.ErrClosed) {
 		t.Fatalf("File.Sync must normalize the closed error: %v", err)
 	}

@@ -28,9 +28,11 @@ func Sync(f *os.File) error {
 func normalizeControlError(f *os.File, err error) error {
 	if err != nil {
 		// RawControl exposes poll.ErrFileClosing rather than os.ErrClosed.
-		// Confirm through the public File API, retaining the original cause.
-		if _, statErr := f.Stat(); errors.Is(statErr, os.ErrClosed) {
-			return errors.Join(err, os.ErrClosed)
+		// File.Stat on Windows queries the raw handle and does not normalize
+		// closure. File.Sync uses the poll lock and the public error mapping.
+		// Only probe after Control failed; preserve both failures if it fails.
+		if syncErr := f.Sync(); syncErr != nil {
+			return errors.Join(err, syncErr)
 		}
 	}
 	return err
@@ -75,8 +77,9 @@ func reopenWritableDirectory(handle windows.Handle) (windows.Handle, error) {
 	const options = windows.FILE_DIRECTORY_FILE | windows.FILE_SYNCHRONOUS_IO_NONALERT
 	var reopened windows.Handle
 	// FILE_GENERIC_WRITE is the mapped GENERIC_WRITE mask (including SYNCHRONIZE).
+	// READ_ATTRIBUTES also permits identity inspection of the reopened object.
 	// Native directory opens need no backup intent; ordinary ACL checks apply.
-	err := windows.NtCreateFile(&reopened, windows.FILE_GENERIC_WRITE, &attrs,
+	err := windows.NtCreateFile(&reopened, windows.FILE_GENERIC_WRITE|windows.FILE_READ_ATTRIBUTES, &attrs,
 		&windows.IO_STATUS_BLOCK{}, nil, 0, share, windows.FILE_OPEN, options, 0, 0)
 	if status, ok := err.(windows.NTStatus); ok {
 		err = status.Errno()
