@@ -1,0 +1,32 @@
+name: Windows storage API diagnostic (not durability acceptance)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  GOTOOLCHAIN: local
+  CGO_ENABLED: '0'
+jobs:
+  observe:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-go@v5.5.0
+        with:
+          go-version-file: .go-version
+      - name: Test diagnostic helpers
+        run: go test -count=1 ./scripts/windows-durability-probe
+      - name: Observe APIs only in a fresh temporary directory
+        run: go run ./scripts/windows-durability-probe > windows-durability-report.json
+      - name: Retain observations even when setup or an invariant fails
+        if: always()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: windows-storage-api-observations
+          path: windows-durability-report.json
+          if-no-files-found: warn
+          retention-days: 14
