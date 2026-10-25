@@ -1,0 +1,3 @@
+# Keep formatter and shell inputs consistent across platforms, including Windows
+# checkouts with core.autocrlf=true. Auto detection preserves binary files.
+* text=auto eol=lf
