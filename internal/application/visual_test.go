@@ -2,6 +2,7 @@ package application_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"os"
 	"path/filepath"
 	"testing"
@@ -12,6 +13,12 @@ import (
 )
 
 func TestVisualTransferWithLossAndRestart(t *testing.T) {
+	t.Run("monochrome", func(t *testing.T) { testVisualTransfer(t, application.Monochrome) })
+	t.Run("four-color", func(t *testing.T) { testVisualTransfer(t, application.Colors4) })
+	t.Run("eight-color", func(t *testing.T) { testVisualTransfer(t, application.Colors8) })
+}
+
+func testVisualTransfer(t *testing.T, profile application.ColorProfile) {
 	src, state, dest := t.TempDir(), t.TempDir(), t.TempDir()
 	want := make([]byte, 4096)
 	for i := range want {
@@ -33,11 +40,11 @@ func TestVisualTransferWithLossAndRestart(t *testing.T) {
 	}
 	feed := func(n uint64) {
 		t.Helper()
-		q, e := p.Packet(n)
+		q, e := p.Page(n, profile)
 		if e != nil {
 			t.Fatal(e)
 		}
-		img, e := codec.Render(p.Descriptor, q, n, n, 1)
+		img, e := codec.RenderPage(p.Descriptor, q, profile, n, n, 1)
 		if e != nil {
 			t.Fatal(e)
 		}
@@ -54,13 +61,13 @@ func TestVisualTransferWithLossAndRestart(t *testing.T) {
 			}
 		}
 	}
-	for n := uint64(0); n < p.ManifestPackets(); n++ {
+	for n := uint64(0); n < p.ManifestPackets(); n += profile.Capacity() {
 		feed(n)
 	}
-	// Every fifth data packet is deliberately missing in the first pass.
-	for n := p.PacketCount(); n > p.ManifestPackets(); n-- {
-		if (n-1-p.ManifestPackets())%5 != 0 {
-			feed(n - 1)
+	// Lose every third data page, then replay all pages after reopening storage.
+	for n := p.ManifestPackets(); n < p.PacketCount(); n += profile.Capacity() {
+		if ((n-p.ManifestPackets())/profile.Capacity())%3 != 2 {
+			feed(n)
 		}
 	}
 	if err = r.Publish(); err != nil {
@@ -76,9 +83,19 @@ func TestVisualTransferWithLossAndRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for n := p.ManifestPackets(); n < p.PacketCount(); n++ {
+	for n := p.ManifestPackets(); n < p.PacketCount(); n += profile.Capacity() {
 		feed(n)
 		feed(n)
+	}
+	before, err := r.DurableBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	feed(p.PacketCount() - 2) // Eight-color tail with one padding plane.
+	feed(p.PacketCount() - 1) // Color tails with one or two padding planes.
+	after, err := r.DurableBytes()
+	if err != nil || after != before {
+		t.Fatal("padding/duplicate increased progress", err)
 	}
 	if err = r.Publish(); err != nil {
 		t.Fatal(err)
@@ -87,7 +104,7 @@ func TestVisualTransferWithLossAndRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(filepath.Join(dest, "binary")) //nolint:gosec // Test-owned temporary destination.
-	if err != nil || string(got) != string(want) {
+	if err != nil || string(got) != string(want) || sha256.Sum256(got) != sha256.Sum256(want) {
 		t.Fatal("byte mismatch", err)
 	}
 	info, err := os.Stat(filepath.Join(dest, "empty"))

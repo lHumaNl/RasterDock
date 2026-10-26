@@ -46,6 +46,39 @@ func TestTokenIdentityAndInvalidation(t *testing.T) {
 	}
 }
 
+func TestTokenRetentionRemovesMissingWindowsWithoutReusingTokens(t *testing.T) {
+	r := newTokenRegistry()
+	kept := windowIdentity{handle: 1, pid: 2, tid: 3}
+	missing := windowIdentity{handle: 4, pid: 5, tid: 6}
+	keptID, err := r.register(kept)
+	requireError(t, err, nil)
+	missingID, err := r.register(missing)
+	requireError(t, err, nil)
+	r.retain(map[windowIdentity]bool{kept: true})
+	if got, ok := r.lookup(keptID); !ok || got != kept {
+		t.Fatal("retention lost a current window")
+	}
+	if _, ok := r.lookup(missingID); ok {
+		t.Fatal("retention kept a missing window")
+	}
+	again, err := r.register(kept)
+	requireError(t, err, nil)
+	if again != keptID {
+		t.Fatal("retention changed a current window token")
+	}
+	replacementID, err := r.register(missing)
+	requireError(t, err, nil)
+	if replacementID == missingID {
+		t.Fatal("retention allowed a stale token to be reused")
+	}
+	r.retain(nil)
+	for _, id := range []uint32{keptID, replacementID} {
+		if _, ok := r.lookup(id); ok {
+			t.Fatal("empty inventory retained a window")
+		}
+	}
+}
+
 func TestWorkerPendingAndCloseTimeout(t *testing.T) {
 	gate := make(chan struct{}, 1)
 	blocked := make(chan struct{})

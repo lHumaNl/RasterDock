@@ -39,3 +39,18 @@ func TestSavedStateMessagesHaveBothTranslations(t *testing.T) {
 		}
 	}
 }
+
+func TestExperimentalProfileMessagesHaveEnglishFallback(t *testing.T) {
+	for _, language := range []string{"en", "ru"} {
+		catalog, err := Load(language)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, key := range []string{"profile.transport_note", "profile.monochrome", "profile.four", "profile.eight"} {
+			text := catalog.Text(key)
+			if text == "" || strings.HasPrefix(text, "[") {
+				t.Fatalf("missing %s message in %s", key, language)
+			}
+		}
+	}
+}

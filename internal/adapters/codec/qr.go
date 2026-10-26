@@ -1,4 +1,4 @@
-// Package codec renders complete immutable monochrome frames.
+// Package codec renders complete immutable visual frames.
 package codec
 
 import (
@@ -6,6 +6,7 @@ import (
 	"image"
 	"image/color"
 	"image/draw"
+	"slices"
 	"strings"
 
 	"github.com/makiuchi-d/gozxing"
@@ -13,36 +14,13 @@ import (
 	"github.com/makiuchi-d/gozxing/qrcode/decoder"
 	"github.com/makiuchi-d/gozxing/qrcode/encoder"
 
+	"rasterdock/internal/application"
 	v1 "rasterdock/internal/protocol/v1"
 )
 
 // Render uses four physical pixels per module and four modules of quiet zone.
 func Render(d v1.Descriptor, p v1.Packet, ordinal, frame, epoch uint64) (*image.RGBA, error) {
-	if d.Block > 512 {
-		return nil, errors.New("initial monochrome profile supports blocks up to 512 bytes")
-	}
-	wire, err := p.MarshalBinary()
-	if err != nil {
-		return nil, err
-	}
-	b := v1.Beacon{Descriptor: d, Colors: 2, Columns: 1, Rows: 1, Version: 20, Active: 1, Frame: frame, Ordinal: ordinal, Width: 664, Height: 460, GridX: 244, GridY: 40, CellWidth: 420, CellHeight: 420, Module: 4, BeaconModule: 4, Epoch: epoch, Phase: 1}
-	if p.Kind == 1 {
-		b.Phase = 0
-	}
-	beacon, err := b.MarshalBinary()
-	if err != nil {
-		return nil, err
-	}
-	canvas := image.NewRGBA(image.Rect(0, 0, int(b.Width), int(b.Height)))
-	draw.Draw(canvas, canvas.Bounds(), image.NewUniform(color.White), image.Point{}, draw.Src)
-	if err = paint(canvas, "RDH1:"+v1.Encode45(beacon), 8, image.Point{}); err != nil {
-		return nil, err
-	}
-	if err = paint(canvas, "RD1:"+v1.Encode45(wire), 20, image.Pt(244, 40)); err != nil {
-		return nil, err
-	}
-	draw.Draw(canvas, image.Rect(244, 0, 260, 16), image.NewUniform(color.Black), image.Point{}, draw.Src)
-	return canvas, nil
+	return RenderPage(d, []v1.Packet{p}, application.Monochrome, ordinal, frame, epoch)
 }
 
 func paint(dst *image.RGBA, text string, version int, origin image.Point) error {
@@ -74,6 +52,7 @@ func Decode(img image.Image) (v1.Beacon, []v1.Packet, error) {
 		return beacon, nil, err
 	}
 	var packets []v1.Packet
+	var points []gozxing.ResultPoint
 	found := false
 	for _, result := range results {
 		text := result.GetText()
@@ -91,6 +70,7 @@ func Decode(img image.Image) (v1.Beacon, []v1.Packet, error) {
 				return beacon, nil, errors.New("multiple transfers in capture")
 			}
 			beacon = b
+			points = result.GetResultPoints()
 			found = true
 		case strings.HasPrefix(text, "RD1:"):
 			raw, e := v1.Decode45(text[4:])
@@ -106,5 +86,13 @@ func Decode(img image.Image) (v1.Beacon, []v1.Packet, error) {
 	if !found {
 		return beacon, nil, errors.New("RasterDock beacon not found")
 	}
+	if beacon.Colors == byte(application.Colors4) || beacon.Colors == byte(application.Colors8) {
+		return decodeColor(img, beacon, points)
+	}
+	if beacon.Colors != 2 {
+		return beacon, nil, application.ErrProfile
+	}
+	// A torn capture can contain a valid QR from a different transfer.
+	packets = slices.DeleteFunc(packets, func(p v1.Packet) bool { return p.Transfer != beacon.Transfer })
 	return beacon, packets, nil
 }

@@ -168,6 +168,12 @@ func (h *engineHarness) decode(image.Image) (v1.Beacon, []v1.Packet, error) {
 		}
 		packets = append(packets, p)
 	}
+	if h.fault == "foreign-first" || h.fault == "foreign-last" {
+		return decodeMixedTransfer(h.prepared.Descriptor, packets[0], h.fault == "foreign-first")
+	}
+	if h.fault == "invalid-same-transfer" {
+		packets[0].Size++
+	}
 	return v1.Beacon{Descriptor: h.prepared.Descriptor}, packets, nil
 }
 

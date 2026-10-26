@@ -65,15 +65,22 @@ func TestMain(m *testing.M) {
 }
 
 func nativeTestViewer() error {
+	profile := application.Monochrome
+	if os.Getenv("RASTERDOCK_NATIVE_TEST_COLORS") == "4" {
+		profile = application.Colors4
+	}
+	if os.Getenv("RASTERDOCK_NATIVE_TEST_COLORS") == "8" {
+		profile = application.Colors8
+	}
 	p, err := application.OpenPrepared(os.Getenv("RASTERDOCK_NATIVE_TEST_PREPARED"))
 	if err != nil {
 		return err
 	}
-	packet, err := p.Packet(0)
+	packets, err := p.Page(0, profile)
 	if err != nil {
 		return err
 	}
-	img, err := codec.Render(p.Descriptor, packet, 0, 1, 1)
+	img, err := codec.RenderPage(p.Descriptor, packets, profile, 0, 1, 1)
 	if err != nil {
 		return err
 	}
@@ -94,12 +101,12 @@ func nativeTestViewer() error {
 			if e != nil {
 				return
 			}
-			packet, e := p.Packet(n)
+			packets, e := p.Page(n, profile)
 			if e != nil {
 				return
 			}
 			frameID++
-			img, e := codec.Render(p.Descriptor, packet, n, frameID, 1)
+			img, e := codec.RenderPage(p.Descriptor, packets, profile, n, frameID, 1)
 			if e != nil {
 				return
 			}
@@ -111,6 +118,19 @@ func nativeTestViewer() error {
 }
 
 func TestNativeVisualTransfer(t *testing.T) {
+	testNativeVisualTransfer(t, application.Monochrome)
+}
+
+func TestNativeFourColorTransfer(t *testing.T) {
+	testNativeVisualTransfer(t, application.Colors4)
+}
+
+func TestNativeEightColorTransfer(t *testing.T) {
+	testNativeVisualTransfer(t, application.Colors8)
+}
+
+func testNativeVisualTransfer(t *testing.T, profile application.ColorProfile) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Second)
 	t.Cleanup(cancel)
 	must := func(err error) {
@@ -121,7 +141,9 @@ func TestNativeVisualTransfer(t *testing.T) {
 	}
 	root := t.TempDir()
 	source, destination := filepath.Join(root, "source"), filepath.Join(root, "destination")
-	binaryFixture := make([]byte, 1301)
+	// Seven logical packets (one manifest, five binary, one text) allow the
+	// three-plane profile to omit a whole data page and end with two paddings.
+	binaryFixture := make([]byte, 2349)
 	for i := range binaryFixture {
 		binaryFixture[i] = byte(i % 256)
 	}
@@ -145,6 +167,7 @@ func TestNativeVisualTransfer(t *testing.T) {
 	must(err)
 	cmd := exec.CommandContext(ctx, executable) //nolint:gosec // Only re-exec os.Executable(), the current developer test binary; no shell or external executable.
 	cmd.Env = append(os.Environ(), "RASTERDOCK_NATIVE_TEST_VIEWER=1", "RASTERDOCK_NATIVE_TEST_PREPARED="+p.Directory, "RASTERDOCK_NATIVE_TEST_TITLE="+title)
+	cmd.Env = append(cmd.Env, fmt.Sprintf("RASTERDOCK_NATIVE_TEST_COLORS=%d", profile))
 	var diagnostics bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &diagnostics, &diagnostics
 	stdin, err := cmd.StdinPipe()
@@ -187,7 +210,7 @@ func TestNativeVisualTransfer(t *testing.T) {
 	if window == 0 {
 		t.Fatal("own UUID-titled viewer not enumerated within 10s; desktop and Screen Recording required")
 	}
-	t.Logf("host=%s/%s %s own-window=%d manifest=%d packets=%d", runtime.GOOS, runtime.GOARCH, runtime.Version(), window, p.ManifestPackets(), p.PacketCount())
+	t.Logf("host=%s/%s %s colors=%d own-window=%d manifest=%d packets=%d", runtime.GOOS, runtime.GOARCH, runtime.Version(), profile, window, p.ManifestPackets(), p.PacketCount())
 	var receiver *storage.Receiver
 	t.Cleanup(func() {
 		if receiver != nil {
@@ -216,13 +239,13 @@ func TestNativeVisualTransfer(t *testing.T) {
 			}
 			b, packets, e := codec.Decode(frame.Image)
 			last = e
-			if e == nil && b.Transfer == p.Descriptor.Transfer && b.Ordinal == n && len(packets) == 1 {
+			if e == nil && b.Transfer == p.Descriptor.Transfer && b.Ordinal == n && b.Colors == byte(profile) && uint64(len(packets)) == profile.Capacity() {
 				if b.Width != 664 || b.Height != 460 || b.Module != 4 || b.BeaconModule != 4 || b.Version != 20 || b.Columns != 1 || b.Rows != 1 || b.Active != 1 || b.GridX != 244 || b.GridY != 40 || b.CellWidth != 420 || b.CellHeight != 420 {
 					t.Fatalf("decoded geometry differs from the fixed native test profile: %+v", b)
 				}
-				expectedPacket, e := p.Packet(n)
+				expectedPackets, e := p.Page(n, profile)
 				must(e)
-				expected, e := codec.Render(p.Descriptor, expectedPacket, n, b.Frame, 1)
+				expected, e := codec.RenderPage(p.Descriptor, expectedPackets, profile, n, b.Frame, 1)
 				must(e)
 				offset, ok := nativeExactTranslation(frame.Image, expected)
 				if !ok {
@@ -253,17 +276,18 @@ func TestNativeVisualTransfer(t *testing.T) {
 			must(receiver.Accept(packet))
 		}
 	}
-	for n := uint64(0); n < p.ManifestPackets(); n++ {
+	for n := uint64(0); n < p.ManifestPackets(); n += profile.Capacity() {
 		accept(n)
 	}
 	accept(0)
 	must(receiver.Publish())
 	// Delay the first data packet; receive later data in reverse order.
-	missing := p.ManifestPackets()
-	if p.PacketCount() <= missing+1 {
+	missing := ((p.ManifestPackets() + profile.Capacity() - 1) / profile.Capacity()) * profile.Capacity()
+	if p.PacketCount() <= missing+profile.Capacity() {
 		t.Fatal("fixture needs at least two data packets")
 	}
-	for n := p.PacketCount() - 1; n > missing; n-- {
+	lastPage := ((p.PacketCount() - 1) / profile.Capacity()) * profile.Capacity()
+	for n := lastPage; n > missing; n -= profile.Capacity() {
 		accept(n)
 	}
 	must(receiver.Publish())
@@ -283,7 +307,7 @@ func TestNativeVisualTransfer(t *testing.T) {
 	if before == 0 || before != after {
 		t.Fatalf("durability before=%d after=%d", before, after)
 	}
-	accept(p.PacketCount() - 1)
+	accept(lastPage)
 	after, err = receiver.DurableBytes()
 	must(err)
 	if before != after {
@@ -305,6 +329,38 @@ func TestNativeVisualTransfer(t *testing.T) {
 		}
 	}
 	t.Logf("restart durable bytes=%d; missing packet repaired; publication=%d/%d; all bytes/SHA256 verified", before, published, total)
+	// A clean pass measures useful source bytes separately from deliberate loss
+	// and restart. This small-fixture harness rate includes capture polling and
+	// the geometry oracle; it is not a production throughput or speedup claim.
+	for trial := range 3 {
+		measureRoot := t.TempDir()
+		measureDest := filepath.Join(measureRoot, "output")
+		must(os.Mkdir(measureDest, 0700))
+		measured, e := storage.OpenReceive(filepath.Join(measureRoot, "session"), measureDest, descriptor, application.DecodeManifest, measureRoot)
+		must(e)
+		t.Cleanup(func() { _ = measured.Close() })
+		started := time.Now()
+		for n := uint64(0); n < p.PacketCount(); n += profile.Capacity() {
+			b, packets := capture(n)
+			must(measured.CheckDescriptor(b.Descriptor))
+			for _, packet := range packets {
+				must(measured.Accept(packet))
+			}
+		}
+		must(measured.Publish())
+		elapsed := time.Since(started)
+		var sourceBytes int
+		for name, expected := range want {
+			actual, readErr := os.ReadFile(filepath.Join(measureDest, name)) //nolint:gosec // Fixed fixture paths in private temporary output.
+			must(readErr)
+			if !bytes.Equal(actual, expected) || sha256.Sum256(actual) != sha256.Sum256(expected) {
+				t.Fatalf("measurement output differs: %s", name)
+			}
+			sourceBytes += len(expected)
+		}
+		must(measured.Close())
+		t.Logf("clean-pass colors=%d trial=%d verified-source-bytes=%d elapsed=%s useful-bytes/s=%.1f (small-fixture harness, not production throughput)", profile, trial+1, sourceBytes, elapsed, float64(sourceBytes)/elapsed.Seconds())
+	}
 	if nativeWindowChecks != nil {
 		nativeWindowChecks(t, window, cmd.Process.Pid, title)
 	}
