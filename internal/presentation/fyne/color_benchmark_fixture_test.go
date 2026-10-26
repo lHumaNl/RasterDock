@@ -3,6 +3,7 @@ package fyneui
 import (
 	"bytes"
 	"context"
+	"errors"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -13,11 +14,38 @@ import (
 )
 
 const colorBenchmarkBytes = 128 * 1024
+const gridBenchmarkBytes = 512 * 1024
 
 func colorBenchmarkFixture() []byte {
-	b := make([]byte, colorBenchmarkBytes)
+	return benchmarkPayload(colorBenchmarkBytes)
+}
+
+func gridBenchmarkFixture() []byte {
+	return benchmarkPayload(gridBenchmarkBytes)
+}
+
+func benchmarkPayload(size int) []byte {
+	b := make([]byte, size)
 	_, _ = rand.New(rand.NewSource(20261026)).Read(b) //nolint:gosec // Reproducible non-secret benchmark fixture, not a security token.
 	return b
+}
+
+func gridBenchmarkOrder() [3][3]int {
+	return [3][3]int{{1, 4, 6}, {4, 6, 1}, {6, 1, 4}}
+}
+
+func gridBenchmarkProfile(cells int) (application.VisualProfile, error) {
+	p := application.DefaultVisualProfile(application.Colors8)
+	switch cells {
+	case 1:
+	case 4:
+		p.Geometry.Columns, p.Geometry.Rows = 2, 2
+	case 6:
+		p.Geometry.Columns, p.Geometry.Rows = 3, 2
+	default:
+		return application.VisualProfile{}, errors.New("unsupported benchmark grid")
+	}
+	return p, nil
 }
 
 func TestColorBenchmarkFixtureStaysRaw(t *testing.T) {

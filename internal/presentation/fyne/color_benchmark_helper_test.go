@@ -39,6 +39,12 @@ func init() { nativeColorBenchmarkHelper = runColorBenchmarkHelper }
 func runColorBenchmarkHelper() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	cells := os.Getenv("RASTERDOCK_COLOR_BENCHMARK_CELLS")
+	switch cells {
+	case "", "0", "1", "4", "6":
+	default:
+		return fmt.Errorf("unsupported benchmark cell count %q", cells)
+	}
 	id, err := domain.NewID()
 	if err != nil {
 		return err
@@ -53,6 +59,10 @@ func runColorBenchmarkHelper() error {
 	viewport := newQRViewport(picture, w.Canvas(), capacity)
 	w.SetContent(viewport)
 	w.Resize(fyne.NewSize(720, 520))
+	if cells != "" && cells != "0" {
+		// Same test-window area for every grid, never resize per selected grid.
+		w.Resize(fyne.NewSize(900, 650))
+	}
 	result := make(chan error, 1)
 	go func() {
 		result <- colorBenchmarkTrial(ctx, title, w, picture, viewport, capacity)
@@ -80,6 +90,19 @@ func colorBenchmarkTrial(parent context.Context, title string, w fyne.Window, pi
 	n, err := strconv.ParseUint(os.Getenv("RASTERDOCK_COLOR_BENCHMARK_COLORS"), 10, 8)
 	if err != nil || (n != 2 && n != 4 && n != 8) {
 		return fmt.Errorf("invalid profile %q", os.Getenv("RASTERDOCK_COLOR_BENCHMARK_COLORS"))
+	}
+	profile := application.DefaultVisualProfile(application.ColorProfile(n))
+	gridMode := false
+	if value := os.Getenv("RASTERDOCK_COLOR_BENCHMARK_CELLS"); value != "" && value != "0" {
+		cells, parseErr := strconv.Atoi(value)
+		if parseErr != nil || n != 8 {
+			return fmt.Errorf("grid benchmark requires a valid cell count and eight colors")
+		}
+		profile, err = gridBenchmarkProfile(cells)
+		if err != nil {
+			return err
+		}
+		gridMode = true
 	}
 	var window uint32
 	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
@@ -142,7 +165,17 @@ func colorBenchmarkTrial(parent context.Context, title string, w fyne.Window, pi
 			}
 		}
 	}
-	send <- command{kind: "profile", profile: application.ColorProfile(n)}
+	if gridMode {
+		// A common viewport must fit the largest grid even in a 1-cell trial.
+		largest, e := gridBenchmarkProfile(6)
+		if e != nil {
+			return e
+		}
+		if e = checkFit(largest, capacity); e != nil {
+			return e
+		}
+	}
+	send <- command{kind: "profile", visual: profile}
 	if err := wait(sent, "status.idle"); err != nil {
 		return err
 	}
@@ -152,20 +185,35 @@ func colorBenchmarkTrial(parent context.Context, title string, w fyne.Window, pi
 	} // discard initial data-bearing picture
 	var measured atomic.Bool
 	var decoded, packets, failures atomic.Uint64
+	var decodeCalls, decodeNanos, decodeMaxNanos, partialFrames atomic.Uint64
 	var opens atomic.Uint64
+	var captureWidth, captureHeight atomic.Int64
 	receive, received := startEngine(engineIO{
 		openCapture: func(id uint32) (captureStream, error) {
 			opens.Add(1)
 			return platform.OpenCapture(id)
 		},
 		decode: func(img image.Image) (v1.Beacon, []v1.Packet, error) {
+			captureWidth.Store(int64(img.Bounds().Dx()))
+			captureHeight.Store(int64(img.Bounds().Dy()))
+			decodeStart := time.Now()
 			b, p, e := codec.Decode(img)
+			decodeTime := time.Since(decodeStart)
 			if measured.Load() {
+				decodeCalls.Add(1)
+				if decodeTime > 0 {
+					duration := uint64(decodeTime)
+					decodeNanos.Add(duration)
+					decodeMaxNanos.Store(max(decodeMaxNanos.Load(), duration))
+				}
 				if e != nil {
 					failures.Add(1)
 				} else {
 					decoded.Add(1)
 					packets.Add(uint64(len(p)))
+					if uint64(len(p)) < profile.Capacity() {
+						partialFrames.Add(1)
+					}
 				}
 			}
 			return b, p, e
@@ -238,12 +286,18 @@ loop:
 		return err
 	}
 	want := colorBenchmarkFixture()
-	if !bytes.Equal(got, want) || sha256.Sum256(got) != sha256.Sum256(want) || completed != colorBenchmarkBytes {
+	if gridMode {
+		want = gridBenchmarkFixture()
+	}
+	if !bytes.Equal(got, want) || sha256.Sum256(got) != sha256.Sum256(want) || completed != uint64(len(want)) {
 		return fmt.Errorf("published bytes/hash/durable count mismatch: file=%d durable=%d", len(got), completed)
 	}
 	host, _ := os.Hostname()
 	record := map[string]interface{}{
 		"trial": os.Getenv("RASTERDOCK_COLOR_BENCHMARK_TRIAL"), "colors": n,
+		"module": profile.Geometry.Module, "columns": profile.Geometry.Columns, "rows": profile.Geometry.Rows,
+		"packets_per_page": profile.Capacity(), "grid_benchmark": gridMode,
+		"capture_width": captureWidth.Load(), "capture_height": captureHeight.Load(),
 		"host": host, "os": runtime.GOOS, "arch": runtime.GOARCH, "go": runtime.Version(),
 		"gomaxprocs": runtime.GOMAXPROCS(0), "canvas_scale": scale, "window": window,
 		"source_bytes": len(want), "completed_bytes": completed, "sha256": fmt.Sprintf("%x", sha256.Sum256(got)),
@@ -252,8 +306,11 @@ loop:
 		"ui_images_applied": applied, "ui_images_applied_per_second": float64(applied) / elapsed.Seconds(),
 		"decoded_frames": decoded.Load(), "decoded_packets_including_repeats": packets.Load(), "decode_failures": failures.Load(),
 		"decoded_frames_per_second": float64(decoded.Load()) / elapsed.Seconds(), "capture_stream_opens": opens.Load(),
-		"timing":         "blank until auto; capture-open excluded; first-frame through published-completion included; verification excluded",
-		"cadence_caveat": "UI applications are not compositor presentations; decoded frames may repeat; engines share one process",
+		"decode_mean_ms": float64(decodeNanos.Load()) / float64(max(uint64(1), decodeCalls.Load())) / 1e6,
+		"decode_max_ms":  float64(decodeMaxNanos.Load()) / 1e6, "decode_calls": decodeCalls.Load(),
+		"partial_decoded_frames": partialFrames.Load(),
+		"timing":                 "blank until auto; capture-open excluded; first-frame through published-completion included; verification excluded",
+		"cadence_caveat":         "UI applications are not compositor presentations; decoded frames may repeat; engines share one process",
 	}
 	data, err := json.Marshal(record)
 	if err != nil {

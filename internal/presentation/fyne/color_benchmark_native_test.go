@@ -22,6 +22,18 @@ func TestNativeColorBenchmark(t *testing.T) {
 	if os.Getenv("RASTERDOCK_COLOR_BENCHMARK") != "1" {
 		t.Skip("opt in with RASTERDOCK_COLOR_BENCHMARK=1; macOS desktop required")
 	}
+	runNativeThroughputBenchmark(t, false)
+}
+
+func TestNativeGridBenchmark(t *testing.T) {
+	if os.Getenv("RASTERDOCK_GRID_BENCHMARK") != "1" {
+		t.Skip("opt in with RASTERDOCK_GRID_BENCHMARK=1; macOS desktop required")
+	}
+	runNativeThroughputBenchmark(t, true)
+}
+
+func runNativeThroughputBenchmark(t *testing.T, grids bool) {
+	t.Helper()
 	if info, ok := debug.ReadBuildInfo(); ok {
 		for _, setting := range info.Settings {
 			if setting.Key == "-race" && setting.Value == "true" {
@@ -36,15 +48,19 @@ func TestNativeColorBenchmark(t *testing.T) {
 	if err := os.Mkdir(source, 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(source, "payload.bin"), colorBenchmarkFixture(), 0600); err != nil {
+	data, order := colorBenchmarkFixture(), colorBenchmarkOrder()
+	if grids {
+		data, order = gridBenchmarkFixture(), gridBenchmarkOrder()
+	}
+	if err := os.WriteFile(filepath.Join(source, "payload.bin"), data, 0600); err != nil {
 		t.Fatal(err)
 	}
 	p, err := application.Prepare(ctx, source, filepath.Join(root, "prepared"), 512, storage.Flush, root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(p.Manifest.Files) != 1 || p.Manifest.Files[0].Encoding != "raw" || p.Manifest.Files[0].SourceSize != colorBenchmarkBytes {
-		t.Fatal("benchmark requires one uncompressed 128 KiB source file")
+	if len(p.Manifest.Files) != 1 || p.Manifest.Files[0].Encoding != "raw" || p.Manifest.Files[0].SourceSize != uint64(len(data)) {
+		t.Fatal("benchmark requires one uncompressed source file of the configured size")
 	}
 	// No source tree is available to either engine; all nine trials reuse this snapshot.
 	if err := os.RemoveAll(source); err != nil {
@@ -54,9 +70,14 @@ func TestNativeColorBenchmark(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for repeat, order := range colorBenchmarkOrder() {
-		for position, profile := range order {
-			name := fmt.Sprintf("repeat%d_position%d_colors%d", repeat+1, position+1, profile)
+	for repeat, row := range order {
+		for position, selection := range row {
+			colors, cells := selection, 0
+			name := fmt.Sprintf("repeat%d_position%d_colors%d", repeat+1, position+1, colors)
+			if grids {
+				colors, cells = 8, selection
+				name = fmt.Sprintf("repeat%d_position%d_cells%d", repeat+1, position+1, cells)
+			}
 			if !t.Run(name, func(t *testing.T) {
 				trial, stop := context.WithTimeout(ctx, 180*time.Second)
 				defer stop()
@@ -65,7 +86,8 @@ func TestNativeColorBenchmark(t *testing.T) {
 					"RASTERDOCK_COLOR_BENCHMARK_PREPARED="+p.Directory,
 					"RASTERDOCK_COLOR_BENCHMARK_ROOT="+t.TempDir(),
 					"RASTERDOCK_COLOR_BENCHMARK_TRIAL="+name,
-					fmt.Sprintf("RASTERDOCK_COLOR_BENCHMARK_COLORS=%d", profile))
+					fmt.Sprintf("RASTERDOCK_COLOR_BENCHMARK_COLORS=%d", colors),
+					fmt.Sprintf("RASTERDOCK_COLOR_BENCHMARK_CELLS=%d", cells))
 				out, err := cmd.CombinedOutput()
 				t.Logf("%s", out)
 				if trial.Err() != nil || ctx.Err() != nil {
