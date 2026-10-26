@@ -31,6 +31,29 @@ jobs:
       - name: Linux SDK
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev
+      - name: Windows SDK
+        if: runner.os == 'Windows'
+        id: msys2
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: mingw-w64-x86_64-gcc make
+      - name: Select Windows compiler
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
+        run: |
+          $root = $env:MSYS2_LOCATION.Replace('\', '/')
+          "CC=$root/mingw64/bin/gcc.exe" >> $env:GITHUB_ENV
+          "CXX=$root/mingw64/bin/g++.exe" >> $env:GITHUB_ENV
+          "MSYS2_ROOT=$root" >> $env:GITHUB_ENV
+          "$root/mingw64/bin" >> $env:GITHUB_PATH
+          "$root/usr/bin" >> $env:GITHUB_PATH
+      - name: Verify Windows capture SDK
+        if: runner.os == 'Windows'
+        run: bash scripts/check-windows-capture-sdk.sh
       - name: Identify cache paths and toolchain
         id: cache-paths
         run: |
@@ -41,6 +64,9 @@ jobs:
             # apt can update SDKs independently of the hosted image. Include
             # transitive native dependencies: Go does not track external C libs.
             native_packages="$(dpkg-query -W -f='${binary:Package}=${Version}\n' | LC_ALL=C sort)"
+          elif [[ "$RUNNER_OS" == Windows ]]; then
+            # MSYS2 updates headers/CRT independently of GCC and the runner image.
+            native_packages="$("$MSYS2_ROOT/usr/bin/pacman.exe" -Q | LC_ALL=C sort)"
           fi
           compiler_hash="$(printf '%s\n' "${ImageOS:-$RUNNER_OS}" "${ImageVersion:-unknown}" "$cc" "$compiler_id" "$native_packages" | git hash-object --stdin)"
           tools="$(go env GOPATH)/bin"

@@ -1,5 +1,16 @@
 # Windows capture adapter
 
+## Build toolchain
+
+Windows CI explicitly selects the MSYS2 MINGW64 GCC/headers/CRT, rather than
+the hosted runner's unrelated `C:/mingw64` installation. The setup action is
+pinned; MSYS2 packages are updated together (not version-frozen), and their full
+installed inventory participates in the Go build-cache fingerprint.
+`bash scripts/check-windows-capture-sdk.sh` compiles and links the actual WGC
+C sources before cache restoration. It does not run capture or require a desktop.
+Locally, put MSYS2 `mingw64/bin` and `usr/bin` on PATH and set `CC` to that GCC.
+Missing WinRT types/import libraries must fail this check, not disable capture.
+
 The CGO adapter uses installed MinGW C ABI headers, Windows Graphics Capture
 (`CreateForWindow`, `CreateFreeThreaded`) and hardware D3D11. There is no helper,
 installation, elevation, desktop crop, PrintWindow fallback, or C++ runtime.
