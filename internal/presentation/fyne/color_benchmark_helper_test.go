@@ -80,6 +80,11 @@ func runColorBenchmarkHelper() error {
 
 func colorBenchmarkTrial(parent context.Context, title string, w fyne.Window, picture *canvas.Image, viewport fyne.CanvasObject, capacity *viewportCapacity) (err error) {
 	setupStart := time.Now()
+	trace, finishTrace, traceErr := benchmarkFrameTrace()
+	if traceErr != nil {
+		return traceErr
+	}
+	defer func() { err = errors.Join(err, finishTrace()) }()
 	ctx, cancel := context.WithTimeout(parent, 170*time.Second)
 	defer cancel()
 	root := os.Getenv("RASTERDOCK_COLOR_BENCHMARK_ROOT")
@@ -130,6 +135,7 @@ func colorBenchmarkTrial(parent context.Context, title string, w fyne.Window, pi
 	logger := slog.New(slog.NewTextHandler(&logs, nil))
 	var workers sync.WaitGroup
 	startEngine := func(io engineIO) (chan command, chan snapshot) {
+		io = trace.wrap(io)
 		commands, events := make(chan command, 8), make(chan snapshot, 1)
 		workers.Add(1)
 		go func() {
@@ -228,12 +234,23 @@ func colorBenchmarkTrial(parent context.Context, title string, w fyne.Window, pi
 	// First-frame latency remains measured. No transfer pixels have been shown.
 	setupSeconds := time.Since(setupStart).Seconds()
 	start := time.Now()
+	trace.add(frameTraceRecord{Stage: "measurement.begin"})
 	measured.Store(true)
 	send <- command{kind: "auto"}
-	// Match production's separate 200ms mailbox-to-UI poll as well as engine ticks.
-	uiTick := time.NewTicker(200 * time.Millisecond)
-	defer uiTick.Stop()
-	var applied uint64
+	var applied atomic.Uint64
+	senderErrors := startBenchmarkDelivery(ctx, &workers, sent, func(s snapshot) {
+		if s.picture == nil {
+			return
+		}
+		fyne.DoAndWait(func() {
+			trace.add(frameTraceRecord{Stage: "ui.apply.begin", Picture: s.pictureID})
+			picture.Image = s.picture
+			picture.Refresh()
+			viewport.Refresh()
+			applied.Add(1)
+			trace.add(frameTraceRecord{Stage: "ui.apply.complete", Picture: s.pictureID})
+		})
+	})
 	var completed uint64
 	var elapsed time.Duration
 loop:
@@ -241,18 +258,8 @@ loop:
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("incomplete transfer: %w", ctx.Err())
-		case <-uiTick.C:
-			select {
-			case s := <-sent:
-				if s.key == "status.error" {
-					return fmt.Errorf("sender: %v", s.params)
-				}
-				if s.picture != nil {
-					fyne.DoAndWait(func() { picture.Image = s.picture; picture.Refresh(); viewport.Refresh() })
-					applied++
-				}
-			default:
-			}
+		case err := <-senderErrors:
+			return err
 		case s := <-received:
 			if s.key == "status.error" {
 				return fmt.Errorf("receiver: %v", s.params)
@@ -266,6 +273,7 @@ loop:
 				}
 				if total == 1 && published == total {
 					elapsed = time.Since(start)
+					trace.add(frameTraceRecord{Stage: "measurement.end"})
 					completed = count
 					break loop
 				}
@@ -275,6 +283,9 @@ loop:
 	measured.Store(false)
 	cancel()
 	workers.Wait()
+	if err := trace.check(); err != nil {
+		return err
+	}
 	if logs.Len() != 0 {
 		return fmt.Errorf("engine diagnostics: %s", logs.String())
 	}
@@ -294,6 +305,7 @@ loop:
 	}
 	host, _ := os.Hostname()
 	record := map[string]interface{}{
+		"frame_trace_enabled": trace != nil, "trace_timing": "when enabled, in-memory instrumentation overhead included; JSONL dump after cleanup excluded",
 		"trial": os.Getenv("RASTERDOCK_COLOR_BENCHMARK_TRIAL"), "colors": n,
 		"module": profile.Geometry.Module, "columns": profile.Geometry.Columns, "rows": profile.Geometry.Rows,
 		"packets_per_page": profile.Capacity(), "grid_benchmark": gridMode,
@@ -302,8 +314,9 @@ loop:
 		"gomaxprocs": runtime.GOMAXPROCS(0), "canvas_scale": scale, "window": window,
 		"source_bytes": len(want), "completed_bytes": completed, "sha256": fmt.Sprintf("%x", sha256.Sum256(got)),
 		"elapsed_seconds": elapsed.Seconds(), "source_bytes_per_second": float64(len(want)) / elapsed.Seconds(),
-		"setup_seconds_excluded": setupSeconds, "target_engine_fps": 5, "target_ui_poll_fps": 5,
-		"ui_images_applied": applied, "ui_images_applied_per_second": float64(applied) / elapsed.Seconds(),
+		"setup_seconds_excluded": setupSeconds, "target_engine_fps": 5, "ui_delivery_mode": "event-driven",
+		"production_dimensions_refresh_ms": dimensionsRefreshInterval.Milliseconds(),
+		"ui_images_applied":                applied.Load(), "ui_images_applied_per_second": float64(applied.Load()) / elapsed.Seconds(),
 		"decoded_frames": decoded.Load(), "decoded_packets_including_repeats": packets.Load(), "decode_failures": failures.Load(),
 		"decoded_frames_per_second": float64(decoded.Load()) / elapsed.Seconds(), "capture_stream_opens": opens.Load(),
 		"decode_mean_ms": float64(decodeNanos.Load()) / float64(max(uint64(1), decodeCalls.Load())) / 1e6,
@@ -318,4 +331,25 @@ loop:
 	}
 	fmt.Printf("COLOR_BENCHMARK %s\n", data)
 	return nil
+}
+
+// Join this single delivery worker with the engines before trace dumping. The
+// fixture has no dimensions label; only production needs the refresh callback.
+func startBenchmarkDelivery(ctx context.Context, workers *sync.WaitGroup, events <-chan snapshot, apply func(snapshot)) <-chan error {
+	errors := make(chan error, 1)
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		deliverSnapshots(ctx, events, nil, func(s snapshot) {
+			if s.key == "status.error" {
+				select {
+				case errors <- fmt.Errorf("sender: %v", s.params):
+				default:
+				}
+				return
+			}
+			apply(s)
+		}, nil)
+	}()
+	return errors
 }

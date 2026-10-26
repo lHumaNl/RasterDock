@@ -35,16 +35,17 @@ type command struct {
 	visual                             application.VisualProfile
 }
 type snapshot struct {
-	revision uint64
-	profile  application.ColorProfile
-	visual   application.VisualProfile
-	role     string
-	key      string
-	params   map[string]interface{}
-	picture  image.Image
-	sources  []platform.Source
-	session  string
-	prepared string
+	revision  uint64
+	profile   application.ColorProfile
+	visual    application.VisualProfile
+	role      string
+	key       string
+	params    map[string]interface{}
+	picture   image.Image
+	pictureID pictureIdentity
+	sources   []platform.Source
+	session   string
+	prepared  string
 }
 
 // Run starts the public GUI; all I/O and capture belong to one background engine.
@@ -161,48 +162,38 @@ func Run(root string, catalog *locales.Catalog, logger *slog.Logger) {
 	})
 	// One bounded UI delivery at a time; persistence only writes a latest-value mailbox.
 	go func() {
-		ticker := time.NewTicker(200 * time.Millisecond)
+		ticker := time.NewTicker(dimensionsRefreshInterval)
 		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				select {
-				case event := <-events:
-					fyne.DoAndWait(func() {
-						profiles.refreshCapacity(capacity)
-						profiles.reconcile(event)
-						w.SetTitle(windowTitle(catalog, event.role, os.Getpid()))
-						status.SetText(catalog.Text(event.key, event.params))
-						if event.picture != nil {
-							picture.Image = event.picture
-							picture.Refresh()
-							viewport.Refresh()
-						}
-						if event.sources != nil {
-							sources = event.sources
-							options := make([]string, len(sources))
-							for i, s := range sources {
-								options[i] = fmt.Sprintf("%d · %s", s.ID, s.Title)
-							}
-							windows.Options = options
-							// Enumeration may retire native selection tokens. Require an
-							// explicit choice from the refreshed list, never a stale label.
-							windows.ClearSelected()
-						}
-						if event.session != "" {
-							session.SetText(event.session)
-						}
-						if event.prepared != "" {
-							saved.SetText(event.prepared)
-						}
-					})
-				default:
-					fyne.DoAndWait(func() { profiles.refreshCapacity(capacity) })
+		deliverSnapshots(ctx, events, ticker.C, func(event snapshot) {
+			fyne.DoAndWait(func() {
+				profiles.refreshCapacity(capacity)
+				profiles.reconcile(event)
+				w.SetTitle(windowTitle(catalog, event.role, os.Getpid()))
+				status.SetText(catalog.Text(event.key, event.params))
+				if event.picture != nil {
+					picture.Image = event.picture
+					picture.Refresh()
+					viewport.Refresh()
 				}
-			}
-		}
+				if event.sources != nil {
+					sources = event.sources
+					options := make([]string, len(sources))
+					for i, s := range sources {
+						options[i] = fmt.Sprintf("%d · %s", s.ID, s.Title)
+					}
+					windows.Options = options
+					// Enumeration may retire native selection tokens. Require an
+					// explicit choice from the refreshed list, never a stale label.
+					windows.ClearSelected()
+				}
+				if event.session != "" {
+					session.SetText(event.session)
+				}
+				if event.prepared != "" {
+					saved.SetText(event.prepared)
+				}
+			})
+		}, func() { fyne.DoAndWait(func() { profiles.refreshCapacity(capacity) }) })
 	}()
 	w.Show()
 	if err := reconcileInitialWindowSize(w, desiredSize); err != nil {
@@ -220,7 +211,7 @@ func runEngine(ctx context.Context, root string, commands <-chan command, events
 		s.profile = profile.Colors
 		s.visual = profile
 		s.role = role // Carry the successful role even when earlier mailbox values were coalesced.
-		emitSnapshot(events, s)
+		emitObservedSnapshot(events, s, io.observer)
 	}
 	report := func(err error) {
 		logger.Error("operation_failed", "error", err)
@@ -270,7 +261,7 @@ func runEngine(ctx context.Context, root string, commands <-chan command, events
 			return errors.New("open or prepare a transfer first")
 		}
 		observedLoss := io.viewport.load().Lost
-		s, err := renderPrepared(prepared, profile, ordinal, frame+1, epoch, io.viewport)
+		s, err := io.render(prepared, profile, ordinal, frame+1, epoch)
 		if err != nil {
 			return err
 		}

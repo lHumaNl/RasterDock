@@ -187,9 +187,18 @@ func geometryPaused(r geometryReply) bool { return r.Status == "Paused; saved st
 
 func (c *geometryChild) assertRenderedProfile(t *testing.T, columns, rows int) {
 	t.Helper()
-	r := c.call(t, geometryRequest{InspectSender: true})
-	if r.RenderedProfile != [4]int{8, 4, columns, rows} {
-		t.Fatalf("rendered profile differs from selected profile: %v", r.RenderedProfile)
+	// Selectors show pending user intent. A previous command may have rendered
+	// the same grid in four colors while the final eight-color request is queued.
+	// Wait for actual pixels, not an arbitrary delay or optimistic widget values.
+	deadline := time.Now().Add(8 * time.Second)
+	var last geometryReply
+	for time.Now().Before(deadline) {
+		last = c.call(t, geometryRequest{InspectSender: true})
+		if last.RenderedProfile == [4]int{8, 4, columns, rows} && last.Colors == "8 colors — experimental" && last.Module == "4" && last.Grid == fmt.Sprintf("%d × %d", columns, rows) {
+			t.Logf("sender-only rendered profile verified: %v", last.RenderedProfile)
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
-	t.Logf("sender-only rendered profile verified: %v", r.RenderedProfile)
+	t.Fatalf("rendered profile did not converge: %v; %s", last.RenderedProfile, geometryEvidence(last))
 }

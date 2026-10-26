@@ -39,6 +39,7 @@ type receiveOwner interface {
 
 // Per-engine boundaries keep tests headless without mutable package-level hooks.
 type engineIO struct {
+	observer    engineObserver
 	viewport    *viewportCapacity
 	ticks       <-chan time.Time
 	openCapture func(uint32) (captureStream, error)
@@ -79,12 +80,17 @@ func renderPrepared(p *application.Prepared, profile application.VisualProfile, 
 	if err = checkFit(profile, viewport); err != nil {
 		return snapshot{}, err
 	}
-	return snapshot{key: "status.frame", params: map[string]interface{}{"ordinal": ordinal + 1, "total": p.PacketCount()}, picture: img, prepared: p.Directory}, nil
+	return snapshot{key: "status.frame", params: map[string]interface{}{"ordinal": ordinal + 1, "total": p.PacketCount()}, picture: img, pictureID: pictureIdentity{frame, ordinal, epoch}, prepared: p.Directory}, nil
 }
 
 func emitSnapshot(events chan snapshot, s snapshot) {
+	emitObservedSnapshot(events, s, nil)
+}
+
+func emitObservedSnapshot(events chan snapshot, s snapshot, observer engineObserver) {
 	select {
 	case events <- s:
+		observer.record("mailbox.enqueue", s.pictureID, pictureIdentity{}, nil)
 		return
 	default:
 	}
@@ -92,12 +98,16 @@ func emitSnapshot(events chan snapshot, s snapshot) {
 	case pending := <-events:
 		if s.picture == nil && s.visual == pending.visual && s.role == pending.role {
 			s.picture = pending.picture
+			s.pictureID = pending.pictureID
 		}
+		observer.record("mailbox.replace", s.pictureID, pending.pictureID, nil)
 	default:
 	}
 	select {
 	case events <- s:
+		observer.record("mailbox.enqueue", s.pictureID, pictureIdentity{}, nil)
 	default:
+		observer.record("mailbox.drop", s.pictureID, pictureIdentity{}, nil)
 	}
 }
 

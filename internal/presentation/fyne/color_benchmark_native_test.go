@@ -70,6 +70,14 @@ func runNativeThroughputBenchmark(t *testing.T, grids bool) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	traceDir := ""
+	if os.Getenv("RASTERDOCK_FRAME_TRACE") == "1" {
+		traceDir, err = os.MkdirTemp("", "rasterdock-frame-trace-")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("persistent frame traces: %s", traceDir)
+	}
 	for repeat, row := range order {
 		for position, selection := range row {
 			colors, cells := selection, 0
@@ -83,6 +91,7 @@ func runNativeThroughputBenchmark(t *testing.T, grids bool) {
 				defer stop()
 				cmd := exec.CommandContext(trial, exe) // Only this test executable; no shell.
 				cmd.Env = append(os.Environ(), "RASTERDOCK_COLOR_BENCHMARK_HELPER=1",
+					"RASTERDOCK_FRAME_TRACE_DIR="+traceDir,
 					"RASTERDOCK_COLOR_BENCHMARK_PREPARED="+p.Directory,
 					"RASTERDOCK_COLOR_BENCHMARK_ROOT="+t.TempDir(),
 					"RASTERDOCK_COLOR_BENCHMARK_TRIAL="+name,
