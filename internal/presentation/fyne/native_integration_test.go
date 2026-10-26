@@ -36,8 +36,20 @@ import (
 var nativeGUIHelper func() error
 var nativeWindowChecks func(*testing.T, uint32, int, string)
 var nativeColorBenchmarkHelper func() error
+var nativeKeyboardProbeHelper func() error
 
 func TestMain(m *testing.M) {
+	if os.Getenv("RASTERDOCK_KEYBOARD_PROBE_HELPER") == "1" {
+		if nativeKeyboardProbeHelper == nil {
+			fmt.Fprintln(os.Stderr, "keyboard probe requires macOS")
+			os.Exit(1)
+		}
+		if err := nativeKeyboardProbeHelper(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	if os.Getenv("RASTERDOCK_COLOR_BENCHMARK_HELPER") == "1" {
 		if nativeColorBenchmarkHelper == nil {
 			fmt.Fprintln(os.Stderr, "color benchmark requires macOS")
