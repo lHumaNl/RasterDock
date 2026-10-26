@@ -17,7 +17,7 @@ const (
 )
 
 // ErrProfile rejects unavailable profiles without changing prepared state.
-var ErrProfile = errors.New("unsupported visual profile (only monochrome and experimental four/eight colors are available)")
+var ErrProfile = errors.New("unsupported visual profile (colors 2/4/8, module 4/6/8, grid 1x1/2x2/3x2 required)")
 
 // Capacity is the number of independent QR planes in a physical page.
 func (p ColorProfile) Capacity() uint64 {
@@ -35,6 +35,11 @@ func (p ColorProfile) Capacity() uint64 {
 
 // Page reads consecutive logical packets, filling the final plane with valid padding.
 func (p *Prepared) Page(ordinal uint64, profile ColorProfile) ([]v1.Packet, error) {
+	return p.VisualPage(ordinal, DefaultVisualProfile(profile))
+}
+
+// VisualPage fills every cell and plane, in row-major then a/b/c order.
+func (p *Prepared) VisualPage(ordinal uint64, profile VisualProfile) ([]v1.Packet, error) {
 	capacity := profile.Capacity()
 	if capacity == 0 {
 		return nil, ErrProfile

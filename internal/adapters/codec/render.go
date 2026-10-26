@@ -31,15 +31,26 @@ const (
 )
 
 func pageBeacon(d v1.Descriptor, profile application.ColorProfile, ordinal, frame, epoch uint64) v1.Beacon {
-	return v1.Beacon{Descriptor: d, Colors: byte(profile), Columns: 1, Rows: 1, Version: dataVersion, Active: 1, Frame: frame, Ordinal: ordinal, Width: canvasWidth, Height: canvasHeight, GridX: gridX, GridY: gridY, CellWidth: cellSize, CellHeight: cellSize, Module: moduleSize, BeaconModule: moduleSize, Epoch: epoch, Phase: 1}
+	return visualBeacon(d, application.DefaultVisualProfile(profile), ordinal, frame, epoch)
+}
+
+func visualBeacon(d v1.Descriptor, p application.VisualProfile, ordinal, frame, epoch uint64) v1.Beacon {
+	size, _ := p.Size() // Caller validates before constructing or allocating.
+	g := p.Geometry
+	return v1.Beacon{Descriptor: d, Colors: byte(p.Colors), Columns: byte(g.Columns), Rows: byte(g.Rows), Version: dataVersion, Active: uint16(g.Columns * g.Rows), Frame: frame, Ordinal: ordinal, Width: uint16(size.X), Height: uint16(size.Y), GridX: gridX, GridY: gridY, CellWidth: uint16(g.Pitch()), CellHeight: uint16(g.Pitch()), Module: byte(g.Module), BeaconModule: moduleSize, Epoch: epoch, Phase: 1} // #nosec G115 -- Whitelisted geometry is at most 2764x1720, six cells, module eight.
 }
 
 // RenderPage owns its output. Every plane is a complete independently valid QR.
 func RenderPage(d v1.Descriptor, packets []v1.Packet, profile application.ColorProfile, ordinal, frame, epoch uint64) (*image.RGBA, error) {
+	return RenderVisualPage(d, packets, application.DefaultVisualProfile(profile), ordinal, frame, epoch)
+}
+
+// RenderVisualPage validates bounded geometry before allocating the canvas.
+func RenderVisualPage(d v1.Descriptor, packets []v1.Packet, profile application.VisualProfile, ordinal, frame, epoch uint64) (*image.RGBA, error) {
 	if profile.Capacity() == 0 || uint64(len(packets)) != profile.Capacity() || d.Block > maxBlock {
 		return nil, application.ErrProfile
 	}
-	b := pageBeacon(d, profile, ordinal, frame, epoch)
+	b := visualBeacon(d, profile, ordinal, frame, epoch)
 	if packets[0].Kind == 1 {
 		b.Phase = 0
 	}
@@ -47,13 +58,24 @@ func RenderPage(d v1.Descriptor, packets []v1.Packet, profile application.ColorP
 	if err != nil {
 		return nil, err
 	}
-	matrices, err := packetMatrices(d, packets)
-	if err != nil {
+	if err = paintGrid(canvas, d, packets, profile); err != nil {
 		return nil, err
 	}
-	paintPlanes(canvas, matrices)
-	paintPalette(canvas, profile)
 	return canvas, nil
+}
+
+func paintGrid(canvas *image.RGBA, d v1.Descriptor, packets []v1.Packet, profile application.VisualProfile) error {
+	matrices, err := packetMatrices(d, packets)
+	if err != nil {
+		return err
+	}
+	planes := len(matrices) / (profile.Geometry.Columns * profile.Geometry.Rows)
+	for cell := 0; cell < len(matrices)/planes; cell++ {
+		origin := image.Pt(gridX+cell%profile.Geometry.Columns*profile.Geometry.Pitch(), gridY+cell/profile.Geometry.Columns*profile.Geometry.Pitch())
+		paintCell(canvas, matrices[cell*planes:(cell+1)*planes], origin, profile.Geometry.Module)
+	}
+	paintPalette(canvas, profile.Colors)
+	return nil
 }
 
 func beaconCanvas(b v1.Beacon) (*image.RGBA, error) {
@@ -61,7 +83,10 @@ func beaconCanvas(b v1.Beacon) (*image.RGBA, error) {
 	if err != nil {
 		return nil, err
 	}
-	canvas := image.NewRGBA(image.Rect(0, 0, canvasWidth, canvasHeight))
+	if !fixedGeometry(b) {
+		return nil, application.ErrProfile
+	}
+	canvas := image.NewRGBA(image.Rect(0, 0, int(b.Width), int(b.Height)))
 	draw.Draw(canvas, canvas.Bounds(), image.NewUniform(color.White), image.Point{}, draw.Src)
 	if err = paint(canvas, "RDH1:"+v1.Encode45(raw), beaconVersion, image.Point{}); err != nil {
 		return nil, err
@@ -114,6 +139,10 @@ func planeColor(a, b, c int8) color.RGBA {
 }
 
 func paintPlanes(dst *image.RGBA, matrices []*encoder.ByteMatrix) {
+	paintCell(dst, matrices, image.Pt(gridX, gridY), moduleSize)
+}
+
+func paintCell(dst *image.RGBA, matrices []*encoder.ByteMatrix, cell image.Point, module int) {
 	for y := range dataModules {
 		for x := range dataModules {
 			a := matrices[0].Get(x, y)
@@ -125,8 +154,8 @@ func paintPlanes(dst *image.RGBA, matrices []*encoder.ByteMatrix) {
 			if len(matrices) == 3 {
 				c = matrices[2].Get(x, y)
 			}
-			origin := image.Pt(gridX+(x+quietModules)*moduleSize, gridY+(y+quietModules)*moduleSize)
-			draw.Draw(dst, image.Rectangle{Min: origin, Max: origin.Add(image.Pt(moduleSize, moduleSize))}, image.NewUniform(planeColor(a, b, c)), image.Point{}, draw.Src)
+			origin := cell.Add(image.Pt((x+quietModules)*module, (y+quietModules)*module))
+			draw.Draw(dst, image.Rectangle{Min: origin, Max: origin.Add(image.Pt(module, module))}, image.NewUniform(planeColor(a, b, c)), image.Point{}, draw.Src)
 		}
 	}
 }

@@ -15,6 +15,11 @@ func NewPlayback(metadata, total uint64) *Playback {
 
 // NewPagePlayback counts physical pages and allows a page to cross manifest/data.
 func NewPagePlayback(metadata, total uint64, profile application.ColorProfile) (*Playback, error) {
+	return NewVisualPlayback(metadata, total, application.DefaultVisualProfile(profile))
+}
+
+// NewVisualPlayback counts complete physical pages for the selected layout.
+func NewVisualPlayback(metadata, total uint64, profile application.VisualProfile) (*Playback, error) {
 	if profile.Capacity() == 0 {
 		return nil, application.ErrProfile
 	}

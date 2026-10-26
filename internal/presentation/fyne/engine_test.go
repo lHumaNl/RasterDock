@@ -69,6 +69,7 @@ func (r *observedReceiver) Publish() error {
 }
 
 type engineHarness struct {
+	viewport *viewportCapacity
 	t        *testing.T
 	commands chan command
 	events   chan snapshot
@@ -101,7 +102,10 @@ func newHarness(t *testing.T) *engineHarness {
 	h := &engineHarness{t: t, commands: make(chan command), events: make(chan snapshot, 1),
 		ticks: make(chan time.Time), steps: make(chan string, 1), done: make(chan struct{}),
 		cancel: cancel, prepared: prepareFixture(t)}
-	deps := engineIO{ticks: h.ticks, openCapture: h.openCapture, decode: h.decode, openReceive: h.open}
+	capacity := &viewportCapacity{}
+	capacity.store(image.Pt(3000, 2000), image.Point{})
+	h.viewport = capacity
+	deps := engineIO{viewport: capacity, ticks: h.ticks, openCapture: h.openCapture, decode: h.decode, openReceive: h.open}
 	root := t.TempDir()
 	go func() {
 		defer close(h.done)

@@ -32,11 +32,18 @@ type captureMap struct{ x, y, sx, sy float64 }
 type rgb [3]float64
 
 func fixedGeometry(b v1.Beacon) bool {
-	return fixedGrid(b) && b.Version == dataVersion && b.Width == canvasWidth && b.Height == canvasHeight && b.Module == moduleSize && b.BeaconModule == moduleSize && b.Block <= maxBlock
+	p := beaconProfile(b)
+	size, err := p.Size()
+	return err == nil && fixedGrid(b) && b.Version == dataVersion && int(b.Width) == size.X && int(b.Height) == size.Y && b.BeaconModule == moduleSize && b.Block <= maxBlock
 }
 
 func fixedGrid(b v1.Beacon) bool {
-	return b.Columns == 1 && b.Rows == 1 && b.Active == 1 && b.GridX == gridX && b.GridY == gridY && b.CellWidth == cellSize && b.CellHeight == cellSize
+	g := beaconProfile(b).Geometry
+	return g.Pitch() != 0 && int(b.Active) == g.Columns*g.Rows && b.GridX == gridX && b.GridY == gridY && int(b.CellWidth) == g.Pitch() && int(b.CellHeight) == g.Pitch()
+}
+
+func beaconProfile(b v1.Beacon) application.VisualProfile {
+	return application.VisualProfile{Colors: application.ColorProfile(b.Colors), Geometry: application.Geometry{Module: int(b.Module), Columns: int(b.Columns), Rows: int(b.Rows)}}
 }
 
 func geometry(img image.Image, b v1.Beacon, p []gozxing.ResultPoint) (captureMap, error) {
@@ -52,14 +59,14 @@ func geometry(img image.Image, b v1.Beacon, p []gozxing.ResultPoint) (captureMap
 		return captureMap{}, ErrCalibration
 	}
 	m := captureMap{tl.GetX() - finderOrigin*sx + float64(img.Bounds().Min.X), tl.GetY() - finderOrigin*sy + float64(img.Bounds().Min.Y), sx, sy}
-	if !m.inBounds(img.Bounds()) || !m.alignmentValid(p, img.Bounds().Min) {
+	if !m.inCanvas(img.Bounds(), int(b.Width), int(b.Height)) || !m.alignmentValid(p, img.Bounds().Min) {
 		return captureMap{}, ErrCalibration
 	}
 	return m, nil
 }
 
-func (m captureMap) inBounds(bounds image.Rectangle) bool {
-	return m.x >= float64(bounds.Min.X)-0.5 && m.y >= float64(bounds.Min.Y)-0.5 && m.x+canvasWidth*m.sx <= float64(bounds.Max.X)+0.5 && m.y+canvasHeight*m.sy <= float64(bounds.Max.Y)+0.5
+func (m captureMap) inCanvas(bounds image.Rectangle, width, height int) bool {
+	return m.x >= float64(bounds.Min.X)-0.5 && m.y >= float64(bounds.Min.Y)-0.5 && m.x+float64(width)*m.sx <= float64(bounds.Max.X)+0.5 && m.y+float64(height)*m.sy <= float64(bounds.Max.Y)+0.5
 }
 
 func (m captureMap) alignmentValid(points []gozxing.ResultPoint, origin image.Point) bool {
@@ -91,7 +98,7 @@ func distance(a, b rgb) float64 {
 }
 
 func capturedPalette(img image.Image, m captureMap, profile application.ColorProfile) ([]rgb, error) {
-	if profile != application.Colors4 && profile != application.Colors8 {
+	if profile.Capacity() == 0 {
 		return nil, application.ErrProfile
 	}
 	refs := make([]rgb, int(profile))

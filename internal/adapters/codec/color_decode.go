@@ -20,12 +20,13 @@ func decodeColor(img image.Image, b v1.Beacon, points []gozxing.ResultPoint) (v1
 	if err != nil {
 		return b, nil, err
 	}
-	planes := splitPlanes(img, m, refs, application.ColorProfile(b.Colors))
+	planes := splitGrid(img, m, refs, beaconProfile(b))
 	var packets []v1.Packet
 	for _, plane := range planes {
 		p, err := decodePlane(plane)
+		// Filter block-invalid packets here, before storage's terminal validation.
 		// Neither frame ordinal nor a neighbor's failure invalidates a valid packet.
-		if err == nil && p.Transfer == b.Transfer {
+		if err == nil && p.Transfer == b.Transfer && p.ValidateBlock(b.Block) == nil {
 			packets = append(packets, p)
 		}
 	}
@@ -33,14 +34,28 @@ func decodeColor(img image.Image, b v1.Beacon, points []gozxing.ResultPoint) (v1
 }
 
 func splitPlanes(img image.Image, m captureMap, refs []rgb, profile application.ColorProfile) []*gozxing.BitMatrix {
+	return splitCell(img, m, refs, profile, image.Pt(gridX, gridY), moduleSize)
+}
+
+func splitGrid(img image.Image, m captureMap, refs []rgb, p application.VisualProfile) []*gozxing.BitMatrix {
+	var planes []*gozxing.BitMatrix
+	g := p.Geometry
+	for cell := 0; cell < g.Columns*g.Rows; cell++ {
+		origin := image.Pt(gridX+cell%g.Columns*g.Pitch(), gridY+cell/g.Columns*g.Pitch())
+		planes = append(planes, splitCell(img, m, refs, p.Colors, origin, g.Module)...)
+	}
+	return planes
+}
+
+func splitCell(img image.Image, m captureMap, refs []rgb, profile application.ColorProfile, origin image.Point, module int) []*gozxing.BitMatrix {
 	planes := make([]*gozxing.BitMatrix, profile.Capacity())
 	for i := range planes {
 		planes[i], _ = gozxing.NewBitMatrix(dataModules, dataModules) // Fixed positive dimensions.
 	}
 	for y := range dataModules {
 		for x := range dataModules {
-			cx := float64(gridX+(x+quietModules)*moduleSize) + moduleSize/2.0
-			cy := float64(gridY+(y+quietModules)*moduleSize) + moduleSize/2.0
+			cx := float64(origin.X+(x+quietModules)*module) + float64(module)/2
+			cy := float64(origin.Y+(y+quietModules)*module) + float64(module)/2
 			tuple := nearest(m.sample(img, cx, cy), refs)
 			for i, plane := range planes {
 				if tuple&(1<<(len(planes)-1-i)) != 0 {

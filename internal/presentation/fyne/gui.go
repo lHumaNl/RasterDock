@@ -19,7 +19,6 @@ import (
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
 
-	"rasterdock/internal/adapters/codec"
 	"rasterdock/internal/adapters/platform"
 	"rasterdock/internal/adapters/storage"
 	"rasterdock/internal/application"
@@ -29,12 +28,16 @@ import (
 )
 
 type command struct {
+	revision                           uint64
 	kind, source, destination, session string
 	window                             uint32
 	profile                            application.ColorProfile
+	visual                             application.VisualProfile
 }
 type snapshot struct {
+	revision uint64
 	profile  application.ColorProfile
+	visual   application.VisualProfile
 	role     string
 	key      string
 	params   map[string]interface{}
@@ -52,17 +55,14 @@ func Run(root string, catalog *locales.Catalog, logger *slog.Logger) {
 	commands := make(chan command, 8)
 	events := make(chan snapshot, 1)
 	done := make(chan struct{})
-	go func() { defer close(done); engine(ctx, root, commands, events, logger) }()
+	capacity := &viewportCapacity{}
+	go func() { defer close(done); engine(ctx, root, commands, events, logger, capacity) }()
 	source, destination, session := widget.NewEntry(), widget.NewEntry(), widget.NewEntry()
 	status := widget.NewLabel(catalog.Text("status.idle"))
 	status.Wrapping = fyne.TextWrapWord
-	activeProfile := application.Monochrome
-	var profiles *widget.Select
-	profiles = profileSelect(catalog, func(profile application.ColorProfile) {
-		select {
-		case commands <- command{kind: "profile", profile: profile}:
-		default:
-			reflectProfile(profiles, activeProfile)
+	var profiles *visualControls
+	profiles = newVisualControls(catalog, func(profile application.VisualProfile) {
+		if !profiles.enqueue(commands, profile) {
 			status.SetText(catalog.Text("status.busy"))
 		}
 	})
@@ -70,7 +70,7 @@ func Run(root string, catalog *locales.Catalog, logger *slog.Logger) {
 	picture := canvas.NewImageFromImage(image.NewRGBA(image.Rect(0, 0, 1, 1)))
 	picture.FillMode = canvas.ImageFillOriginal
 	picture.ScaleMode = canvas.ImageScalePixels
-	viewport := newQRViewport(picture, w.Canvas())
+	viewport := newQRViewport(picture, w.Canvas(), capacity)
 	windows := localizedSelect(catalog)
 	var sources []platform.Source
 	send := func(kind string) {
@@ -136,7 +136,7 @@ func Run(root string, catalog *locales.Catalog, logger *slog.Logger) {
 	chooser := &savedChooser{ctx: ctx, state: filepath.Join(root, "state"), catalog: catalog, window: w}
 	chooseSend := func(item storage.SavedTransfer) { enqueueOpen(commands, status, catalog, item.Directory) }
 	chooseReceive := func(item storage.SavedReceive) { selectReceive(item, session, destination, windows) }
-	controls := container.NewVBox(note, profiles, widget.NewLabel(catalog.Text("saved.label")), savedControl,
+	controls := container.NewVBox(note, profiles.object(), widget.NewLabel(catalog.Text("saved.label")), savedControl,
 		widget.NewButton(catalog.Text("action.saved"), func() { chooser.show(false, chooseSend, chooseReceive) }),
 		widget.NewButton(catalog.Text("action.sessions"), func() { chooser.show(true, chooseSend, chooseReceive) }),
 		widget.NewLabel(catalog.Text("source.label")), source,
@@ -171,8 +171,8 @@ func Run(root string, catalog *locales.Catalog, logger *slog.Logger) {
 				select {
 				case event := <-events:
 					fyne.DoAndWait(func() {
-						activeProfile = event.profile
-						reflectProfile(profiles, activeProfile)
+						profiles.refreshCapacity(capacity)
+						profiles.reconcile(event)
 						w.SetTitle(windowTitle(catalog, event.role, os.Getpid()))
 						status.SetText(catalog.Text(event.key, event.params))
 						if event.picture != nil {
@@ -199,6 +199,7 @@ func Run(root string, catalog *locales.Catalog, logger *slog.Logger) {
 						}
 					})
 				default:
+					fyne.DoAndWait(func() { profiles.refreshCapacity(capacity) })
 				}
 			}
 		}
@@ -210,41 +211,24 @@ func Run(root string, catalog *locales.Catalog, logger *slog.Logger) {
 	a.Run()
 	cancel()
 }
-
-func engine(ctx context.Context, root string, commands <-chan command, events chan snapshot, logger *slog.Logger) {
-	tick := time.NewTicker(200 * time.Millisecond)
-	defer tick.Stop()
-	runEngine(ctx, root, commands, events, logger, engineIO{
-		ticks: tick.C, openCapture: func(id uint32) (captureStream, error) { return platform.OpenCapture(id) },
-		decode: codec.Decode, openReceive: anchoredReceive(root),
-	})
-}
-
 func runEngine(ctx context.Context, root string, commands <-chan command, events chan snapshot, logger *slog.Logger, io engineIO) {
 	role := "idle"
-	profile := application.Monochrome
+	profile := application.DefaultVisualProfile(application.Monochrome)
+	var revision uint64
 	emit := func(s snapshot) {
-		s.profile = profile
+		s.revision = revision
+		s.profile = profile.Colors
+		s.visual = profile
 		s.role = role // Carry the successful role even when earlier mailbox values were coalesced.
-		select {
-		case events <- s:
-		default:
-			select {
-			case pending := <-events:
-				// Retain only undelivered pixels; consumed images must not be replayed.
-				if s.picture == nil && s.profile == pending.profile && s.role == pending.role {
-					s.picture = pending.picture
-				}
-			default:
-			}
-			select {
-			case events <- s:
-			default:
-			}
-		}
+		emitSnapshot(events, s)
 	}
 	report := func(err error) {
 		logger.Error("operation_failed", "error", err)
+		var fit *fitError
+		if errors.As(err, &fit) {
+			emit(snapshot{key: "profile.fit", params: map[string]interface{}{"width": fit.required.X, "height": fit.required.Y, "availableWidth": fit.available.X, "availableHeight": fit.available.Y}})
+			return
+		}
 		emit(snapshot{key: "status.error", params: map[string]interface{}{"error": err.Error()}})
 	}
 	var prepared *application.Prepared
@@ -255,6 +239,8 @@ func runEngine(ctx context.Context, root string, commands <-chan command, events
 	var playback *presentation.Playback
 	var receive command
 	var calibration calibrationGuard
+	lastLost := io.viewport.load().Lost
+	fitBlocked := false
 	// Every terminal transition relinquishes both the receiver and its command.
 	stop := func() error {
 		mode = ""
@@ -283,17 +269,16 @@ func runEngine(ctx context.Context, root string, commands <-chan command, events
 		if prepared == nil {
 			return errors.New("open or prepare a transfer first")
 		}
-		p, err := prepared.Page(ordinal, profile)
-		if err != nil {
-			return err
-		}
-		frame++
-		img, err := codec.RenderPage(prepared.Descriptor, p, profile, ordinal, frame, epoch)
+		observedLoss := io.viewport.load().Lost
+		s, err := renderPrepared(prepared, profile, ordinal, frame+1, epoch, io.viewport)
 		if err != nil {
 			return err
 		}
 		role = "sender"
-		emit(snapshot{key: "status.frame", params: map[string]interface{}{"ordinal": ordinal + 1, "total": prepared.PacketCount()}, picture: img, prepared: prepared.Directory})
+		frame++
+		fitBlocked = false
+		lastLost = observedLoss // Never acknowledge a loss that happened during rendering.
+		emit(s)
 		return nil
 	}
 	for {
@@ -301,6 +286,9 @@ func runEngine(ctx context.Context, root string, commands <-chan command, events
 		case <-ctx.Done():
 			return
 		case cmd := <-commands:
+			if cmd.kind == "profile" {
+				revision = max(revision, cmd.revision)
+			}
 			if cmd.kind == "pause" {
 				if err := stop(); err != nil {
 					report(err)
@@ -316,15 +304,23 @@ func runEngine(ctx context.Context, root string, commands <-chan command, events
 			var err error
 			switch cmd.kind {
 			case "profile":
-				if cmd.profile.Capacity() == 0 {
+				requested := cmd.visual
+				if requested == (application.VisualProfile{}) {
+					requested = profile
+					requested.Colors = cmd.profile
+				}
+				mode = "" // Even rejected profile requests pause playback.
+				if requested.Capacity() == 0 {
 					err = application.ErrProfile
 					break
 				}
-				mode = "" // A user-driven layout change pauses timer playback.
 				previousProfile, previousPlayback, previousFrame := profile, playback, frame
-				profile = cmd.profile
+				if err = checkFit(requested, io.viewport); err != nil {
+					break
+				}
+				profile = requested
 				if prepared != nil {
-					playback, err = presentation.NewPagePlayback(prepared.ManifestPackets(), prepared.PacketCount(), profile)
+					playback, err = presentation.NewVisualPlayback(prepared.ManifestPackets(), prepared.PacketCount(), profile)
 					if err == nil {
 						err = show()
 					}
@@ -351,7 +347,7 @@ func runEngine(ctx context.Context, root string, commands <-chan command, events
 					epoch = binary.BigEndian.Uint64(id[:8])
 					ordinal = 0
 					frame = 0
-					playback, err = presentation.NewPagePlayback(prepared.ManifestPackets(), prepared.PacketCount(), profile)
+					playback, err = presentation.NewVisualPlayback(prepared.ManifestPackets(), prepared.PacketCount(), profile)
 					if err == nil {
 						err = show()
 					}
@@ -371,9 +367,11 @@ func runEngine(ctx context.Context, root string, commands <-chan command, events
 				}
 				err = show()
 			case "auto":
+				observedLoss := io.viewport.load().Lost
 				if prepared == nil {
 					err = errors.New("no prepared transfer")
-				} else {
+				} else if err = checkFit(profile, io.viewport); err == nil {
+					lastLost = observedLoss
 					mode = "auto"
 				}
 			case "windows":
@@ -410,6 +408,16 @@ func runEngine(ctx context.Context, root string, commands <-chan command, events
 				fail(err)
 			}
 		case <-io.ticks:
+			space := io.viewport.load()
+			if role == "sender" && !fitBlocked && (checkFit(profile, io.viewport) != nil || space.Lost != lastLost) {
+				mode = ""
+				fitBlocked = true
+				emit(snapshot{key: "status.paused", picture: image.NewRGBA(image.Rect(0, 0, 1, 1))})
+				if err := checkFit(profile, io.viewport); err != nil {
+					report(err)
+				}
+			}
+			lastLost = space.Lost
 			if mode == "auto" {
 				ordinal = playback.Next()
 				if err := show(); err != nil {

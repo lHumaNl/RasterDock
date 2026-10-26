@@ -35,8 +35,20 @@ import (
 // TestMain, not a testing goroutine, owns the native application's main thread.
 var nativeGUIHelper func() error
 var nativeWindowChecks func(*testing.T, uint32, int, string)
+var nativeColorBenchmarkHelper func() error
 
 func TestMain(m *testing.M) {
+	if os.Getenv("RASTERDOCK_COLOR_BENCHMARK_HELPER") == "1" {
+		if nativeColorBenchmarkHelper == nil {
+			fmt.Fprintln(os.Stderr, "color benchmark requires macOS")
+			os.Exit(1)
+		}
+		if err := nativeColorBenchmarkHelper(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	if os.Getenv("RASTERDOCK_NATIVE_GUI_HELPER") == "1" {
 		if nativeGUIHelper == nil {
 			fmt.Fprintln(os.Stderr, "native GUI helper unavailable on this platform")
@@ -65,22 +77,31 @@ func TestMain(m *testing.M) {
 }
 
 func nativeTestViewer() error {
-	profile := application.Monochrome
+	colors := application.Monochrome
 	if os.Getenv("RASTERDOCK_NATIVE_TEST_COLORS") == "4" {
-		profile = application.Colors4
+		colors = application.Colors4
 	}
 	if os.Getenv("RASTERDOCK_NATIVE_TEST_COLORS") == "8" {
-		profile = application.Colors8
+		colors = application.Colors8
+	}
+	profile := application.DefaultVisualProfile(colors)
+	if value := os.Getenv("RASTERDOCK_NATIVE_TEST_GEOMETRY"); value != "" {
+		if _, err := fmt.Sscanf(value, "%d,%d,%d", &profile.Geometry.Module, &profile.Geometry.Columns, &profile.Geometry.Rows); err != nil {
+			return err
+		}
+	}
+	if _, err := profile.Size(); err != nil {
+		return err
 	}
 	p, err := application.OpenPrepared(os.Getenv("RASTERDOCK_NATIVE_TEST_PREPARED"))
 	if err != nil {
 		return err
 	}
-	packets, err := p.Page(0, profile)
+	packets, err := p.VisualPage(0, profile)
 	if err != nil {
 		return err
 	}
-	img, err := codec.RenderPage(p.Descriptor, packets, profile, 0, 1, 1)
+	img, err := codec.RenderVisualPage(p.Descriptor, packets, profile, 0, 1, 1)
 	if err != nil {
 		return err
 	}
@@ -91,7 +112,10 @@ func nativeTestViewer() error {
 	picture.ScaleMode = canvas.ImageScalePixels
 	viewport := newQRViewport(picture, w.Canvas())
 	w.SetContent(viewport)
-	w.Resize(fyne.NewSize(720, 520))
+	// Test-owned viewer only: request room for the chosen physical canvas on
+	// both Retina and 1x displays. Production never silently grows/shrinks a profile.
+	logical, _ := physicalImageGeometry(img.Bounds(), fyne.Size{}, w.Canvas().PixelCoordinateForPosition)
+	w.Resize(fyne.NewSize(max(720, logical.Width+80), max(520, logical.Height+80)))
 	go func() {
 		defer fyne.Do(w.Close)
 		frameID := uint64(1)
@@ -101,12 +125,12 @@ func nativeTestViewer() error {
 			if e != nil {
 				return
 			}
-			packets, e := p.Page(n, profile)
+			packets, e := p.VisualPage(n, profile)
 			if e != nil {
 				return
 			}
 			frameID++
-			img, e := codec.RenderPage(p.Descriptor, packets, profile, n, frameID, 1)
+			img, e := codec.RenderVisualPage(p.Descriptor, packets, profile, n, frameID, 1)
 			if e != nil {
 				return
 			}
@@ -118,18 +142,31 @@ func nativeTestViewer() error {
 }
 
 func TestNativeVisualTransfer(t *testing.T) {
-	testNativeVisualTransfer(t, application.Monochrome)
+	testNativeVisualTransfer(t, application.DefaultVisualProfile(application.Monochrome))
 }
 
 func TestNativeFourColorTransfer(t *testing.T) {
-	testNativeVisualTransfer(t, application.Colors4)
+	testNativeVisualTransfer(t, application.DefaultVisualProfile(application.Colors4))
 }
 
 func TestNativeEightColorTransfer(t *testing.T) {
-	testNativeVisualTransfer(t, application.Colors8)
+	testNativeVisualTransfer(t, application.DefaultVisualProfile(application.Colors8))
 }
 
-func testNativeVisualTransfer(t *testing.T, profile application.ColorProfile) {
+func TestNativeGeometryTransfer(t *testing.T) {
+	for _, profile := range []application.VisualProfile{
+		{Colors: application.Monochrome, Geometry: application.Geometry{Module: 8, Columns: 1, Rows: 1}},
+		{Colors: application.Colors4, Geometry: application.Geometry{Module: 6, Columns: 1, Rows: 1}},
+		{Colors: application.Colors4, Geometry: application.Geometry{Module: 4, Columns: 2, Rows: 2}},
+		{Colors: application.Colors8, Geometry: application.Geometry{Module: 4, Columns: 3, Rows: 2}},
+	} {
+		t.Run(fmt.Sprintf("colors%d_module%d_grid%dx%d", profile.Colors, profile.Geometry.Module, profile.Geometry.Columns, profile.Geometry.Rows), func(t *testing.T) {
+			testNativeVisualTransfer(t, profile)
+		})
+	}
+}
+
+func testNativeVisualTransfer(t *testing.T, profile application.VisualProfile) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Second)
 	t.Cleanup(cancel)
@@ -141,9 +178,13 @@ func testNativeVisualTransfer(t *testing.T, profile application.ColorProfile) {
 	}
 	root := t.TempDir()
 	source, destination := filepath.Join(root, "source"), filepath.Join(root, "destination")
-	// Seven logical packets (one manifest, five binary, one text) allow the
-	// three-plane profile to omit a whole data page and end with two paddings.
-	binaryFixture := make([]byte, 2349)
+	// Every fixture has at least three pages, including a wholly omitted data
+	// page and a later partial page. Bound the test allocation before conversion.
+	capacity := profile.Capacity()
+	if capacity == 0 || capacity > 18 {
+		t.Fatal("unsupported native test capacity")
+	}
+	binaryFixture := make([]byte, max(uint64(2349), (2*capacity-1)*512+301))
 	for i := range binaryFixture {
 		binaryFixture[i] = byte(i % 256)
 	}
@@ -167,7 +208,8 @@ func testNativeVisualTransfer(t *testing.T, profile application.ColorProfile) {
 	must(err)
 	cmd := exec.CommandContext(ctx, executable) //nolint:gosec // Only re-exec os.Executable(), the current developer test binary; no shell or external executable.
 	cmd.Env = append(os.Environ(), "RASTERDOCK_NATIVE_TEST_VIEWER=1", "RASTERDOCK_NATIVE_TEST_PREPARED="+p.Directory, "RASTERDOCK_NATIVE_TEST_TITLE="+title)
-	cmd.Env = append(cmd.Env, fmt.Sprintf("RASTERDOCK_NATIVE_TEST_COLORS=%d", profile))
+	cmd.Env = append(cmd.Env, fmt.Sprintf("RASTERDOCK_NATIVE_TEST_COLORS=%d", profile.Colors),
+		fmt.Sprintf("RASTERDOCK_NATIVE_TEST_GEOMETRY=%d,%d,%d", profile.Geometry.Module, profile.Geometry.Columns, profile.Geometry.Rows))
 	var diagnostics bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &diagnostics, &diagnostics
 	stdin, err := cmd.StdinPipe()
@@ -210,7 +252,7 @@ func testNativeVisualTransfer(t *testing.T, profile application.ColorProfile) {
 	if window == 0 {
 		t.Fatal("own UUID-titled viewer not enumerated within 10s; desktop and Screen Recording required")
 	}
-	t.Logf("host=%s/%s %s colors=%d own-window=%d manifest=%d packets=%d", runtime.GOOS, runtime.GOARCH, runtime.Version(), profile, window, p.ManifestPackets(), p.PacketCount())
+	t.Logf("host=%s/%s %s profile=%+v own-window=%d manifest=%d packets=%d", runtime.GOOS, runtime.GOARCH, runtime.Version(), profile, window, p.ManifestPackets(), p.PacketCount())
 	var receiver *storage.Receiver
 	t.Cleanup(func() {
 		if receiver != nil {
@@ -239,13 +281,16 @@ func testNativeVisualTransfer(t *testing.T, profile application.ColorProfile) {
 			}
 			b, packets, e := codec.Decode(frame.Image)
 			last = e
-			if e == nil && b.Transfer == p.Descriptor.Transfer && b.Ordinal == n && b.Colors == byte(profile) && uint64(len(packets)) == profile.Capacity() {
-				if b.Width != 664 || b.Height != 460 || b.Module != 4 || b.BeaconModule != 4 || b.Version != 20 || b.Columns != 1 || b.Rows != 1 || b.Active != 1 || b.GridX != 244 || b.GridY != 40 || b.CellWidth != 420 || b.CellHeight != 420 {
+			if e == nil && b.Transfer == p.Descriptor.Transfer && b.Ordinal == n && b.Colors == byte(profile.Colors) && uint64(len(packets)) == profile.Capacity() {
+				size, sizeErr := profile.Size()
+				must(sizeErr)
+				g := profile.Geometry
+				if int(b.Width) != size.X || int(b.Height) != size.Y || int(b.Module) != g.Module || b.BeaconModule != 4 || b.Version != 20 || int(b.Columns) != g.Columns || int(b.Rows) != g.Rows || int(b.Active) != g.Columns*g.Rows || b.GridX != 244 || b.GridY != 40 || int(b.CellWidth) != g.Pitch() || int(b.CellHeight) != g.Pitch() {
 					t.Fatalf("decoded geometry differs from the fixed native test profile: %+v", b)
 				}
-				expectedPackets, e := p.Page(n, profile)
+				expectedPackets, e := p.VisualPage(n, profile)
 				must(e)
-				expected, e := codec.RenderPage(p.Descriptor, expectedPackets, profile, n, b.Frame, 1)
+				expected, e := codec.RenderVisualPage(p.Descriptor, expectedPackets, profile, n, b.Frame, 1)
 				must(e)
 				offset, ok := nativeExactTranslation(frame.Image, expected)
 				if !ok {
@@ -359,7 +404,7 @@ func testNativeVisualTransfer(t *testing.T, profile application.ColorProfile) {
 			sourceBytes += len(expected)
 		}
 		must(measured.Close())
-		t.Logf("clean-pass colors=%d trial=%d verified-source-bytes=%d elapsed=%s useful-bytes/s=%.1f (small-fixture harness, not production throughput)", profile, trial+1, sourceBytes, elapsed, float64(sourceBytes)/elapsed.Seconds())
+		t.Logf("clean-pass profile=%+v trial=%d verified-source-bytes=%d elapsed=%s useful-bytes/s=%.1f (geometry fixture harness, not comparable production throughput)", profile, trial+1, sourceBytes, elapsed, float64(sourceBytes)/elapsed.Seconds())
 	}
 	if nativeWindowChecks != nil {
 		nativeWindowChecks(t, window, cmd.Process.Pid, title)

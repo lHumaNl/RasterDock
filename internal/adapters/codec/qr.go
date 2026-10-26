@@ -40,7 +40,7 @@ func paint(dst *image.RGBA, text string, version int, origin image.Point) error 
 	return nil
 }
 
-// Decode owns a fresh reader and returns independently CRC-validated packets.
+// Decode owns a fresh reader and independently validates CRC and block layout.
 func Decode(img image.Image) (v1.Beacon, []v1.Packet, error) {
 	var beacon v1.Beacon
 	bitmap, err := gozxing.NewBinaryBitmapFromImage(img)
@@ -86,13 +86,19 @@ func Decode(img image.Image) (v1.Beacon, []v1.Packet, error) {
 	if !found {
 		return beacon, nil, errors.New("RasterDock beacon not found")
 	}
+	if !fixedGeometry(beacon) {
+		return beacon, nil, application.ErrProfile
+	}
+	if beacon.Module != moduleSize || beacon.Columns != 1 || beacon.Rows != 1 {
+		return decodeColor(img, beacon, points)
+	}
 	if beacon.Colors == byte(application.Colors4) || beacon.Colors == byte(application.Colors8) {
 		return decodeColor(img, beacon, points)
 	}
 	if beacon.Colors != 2 {
 		return beacon, nil, application.ErrProfile
 	}
-	// A torn capture can contain a valid QR from a different transfer.
-	packets = slices.DeleteFunc(packets, func(p v1.Packet) bool { return p.Transfer != beacon.Transfer })
+	// A torn capture can contain foreign or CRC-valid but block-invalid packets.
+	packets = slices.DeleteFunc(packets, func(p v1.Packet) bool { return p.Transfer != beacon.Transfer || p.ValidateBlock(beacon.Block) != nil })
 	return beacon, packets, nil
 }

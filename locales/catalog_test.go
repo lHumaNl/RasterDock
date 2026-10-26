@@ -54,3 +54,21 @@ func TestExperimentalProfileMessagesHaveEnglishFallback(t *testing.T) {
 		}
 	}
 }
+
+func TestGeometryMessagesLocalized(t *testing.T) {
+	en, err := Load("en")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ru, err := Load("ru")
+	if err != nil {
+		t.Fatal(err)
+	}
+	params := map[string]interface{}{"width": 2764, "height": 1720, "availableWidth": 664, "availableHeight": 460}
+	for _, key := range []string{"profile.module", "profile.grid", "profile.required", "profile.available", "profile.fit"} {
+		a, b := en.Text(key, params), ru.Text(key, params)
+		if a == b || strings.HasPrefix(a, "[") || strings.HasPrefix(b, "[") || strings.Contains(a, "<no value>") || strings.Contains(b, "<no value>") {
+			t.Fatal(key, a, b)
+		}
+	}
+}

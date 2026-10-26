@@ -2,9 +2,12 @@ package fyneui
 
 import (
 	"context"
+	"fmt"
 	"image"
+	"log/slog"
 	"time"
 
+	"rasterdock/internal/adapters/codec"
 	"rasterdock/internal/adapters/platform"
 	"rasterdock/internal/adapters/storage"
 	"rasterdock/internal/application"
@@ -14,6 +17,15 @@ import (
 type captureStream interface {
 	Next(context.Context) (platform.Frame, error)
 	Close() error
+}
+
+func engine(ctx context.Context, root string, commands <-chan command, events chan snapshot, logger *slog.Logger, capacity *viewportCapacity) {
+	tick := time.NewTicker(200 * time.Millisecond)
+	defer tick.Stop()
+	runEngine(ctx, root, commands, events, logger, engineIO{
+		viewport: capacity, ticks: tick.C, openCapture: func(id uint32) (captureStream, error) { return platform.OpenCapture(id) },
+		decode: codec.Decode, openReceive: anchoredReceive(root),
+	})
 }
 
 type receiveOwner interface {
@@ -27,10 +39,66 @@ type receiveOwner interface {
 
 // Per-engine boundaries keep tests headless without mutable package-level hooks.
 type engineIO struct {
+	viewport    *viewportCapacity
 	ticks       <-chan time.Time
 	openCapture func(uint32) (captureStream, error)
 	decode      func(image.Image) (v1.Beacon, []v1.Packet, error)
 	openReceive func(string, string, v1.Descriptor) (receiveOwner, error)
+}
+
+type fitError struct{ required, available image.Point }
+
+func (e *fitError) Error() string {
+	return fmt.Sprintf("required %dx%d physical pixels, available %dx%d; enlarge the window or select a smaller module/grid", e.required.X, e.required.Y, e.available.X, e.available.Y)
+}
+
+func checkFit(profile application.VisualProfile, viewport *viewportCapacity) error {
+	required, err := profile.Size()
+	if err != nil {
+		return err
+	}
+	available := viewport.load().Size
+	if required.X > available.X || required.Y > available.Y {
+		return &fitError{required, available}
+	}
+	return nil
+}
+
+func renderPrepared(p *application.Prepared, profile application.VisualProfile, ordinal, frame, epoch uint64, viewport *viewportCapacity) (snapshot, error) {
+	if err := checkFit(profile, viewport); err != nil {
+		return snapshot{}, err
+	}
+	packets, err := p.VisualPage(ordinal, profile)
+	if err != nil {
+		return snapshot{}, err
+	}
+	img, err := codec.RenderVisualPage(p.Descriptor, packets, profile, ordinal, frame, epoch)
+	if err != nil {
+		return snapshot{}, err
+	}
+	if err = checkFit(profile, viewport); err != nil {
+		return snapshot{}, err
+	}
+	return snapshot{key: "status.frame", params: map[string]interface{}{"ordinal": ordinal + 1, "total": p.PacketCount()}, picture: img, prepared: p.Directory}, nil
+}
+
+func emitSnapshot(events chan snapshot, s snapshot) {
+	select {
+	case events <- s:
+		return
+	default:
+	}
+	select {
+	case pending := <-events:
+		if s.picture == nil && s.visual == pending.visual && s.role == pending.role {
+			s.picture = pending.picture
+		}
+	default:
+	}
+	select {
+	case events <- s:
+	default:
+	}
 }
 
 // anchoredReceive binds the engine's caller-established private state namespace.
