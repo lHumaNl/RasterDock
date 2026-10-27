@@ -1,4 +1,4 @@
-// Package platform owns OS screen-capture resources. It never sends keyboard input.
+// Package platform owns OS capture and explicitly bound, guarded input resources.
 package platform
 
 import (
@@ -19,6 +19,11 @@ type Source struct {
 type Frame struct {
 	Image      *image.RGBA
 	CapturedAt time.Time
+	// ControlCapturedAt is a monotonic, conservative display/acquisition bound.
+	// Only OpenControlCapture may assert ControlAgeBounded; passive frames cannot.
+	ControlCapturedAt time.Time
+	ControlAgeBounded bool
+	Generation        uint64
 }
 
 // Stream owns a capture session. Call Close even after a terminal Next error.

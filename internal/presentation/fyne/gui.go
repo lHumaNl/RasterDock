@@ -27,27 +27,6 @@ import (
 	"rasterdock/locales"
 )
 
-type command struct {
-	revision                           uint64
-	kind, source, destination, session string
-	window                             uint32
-	profile                            application.ColorProfile
-	visual                             application.VisualProfile
-}
-type snapshot struct {
-	revision  uint64
-	profile   application.ColorProfile
-	visual    application.VisualProfile
-	role      string
-	key       string
-	params    map[string]interface{}
-	picture   image.Image
-	pictureID pictureIdentity
-	sources   []platform.Source
-	session   string
-	prepared  string
-}
-
 // Run starts the public GUI; all I/O and capture belong to one background engine.
 func Run(root string, catalog *locales.Catalog, logger *slog.Logger) {
 	a := newTransientApp()
@@ -57,7 +36,14 @@ func Run(root string, catalog *locales.Catalog, logger *slog.Logger) {
 	events := make(chan snapshot, 1)
 	done := make(chan struct{})
 	capacity := &viewportCapacity{}
-	go func() { defer close(done); engine(ctx, root, commands, events, logger, capacity) }()
+	control := &controlUI{window: w, catalog: catalog, commands: commands}
+	control.focusState = func() (bool, uint64) {
+		return platform.OwnWindowFocusState(windowTitle(catalog, "sender", os.Getpid()))
+	}
+	go func() {
+		defer close(done)
+		engine(ctx, root, commands, events, logger, capacity, control.focused, func() { control.authorized.Store(false) })
+	}()
 	source, destination, session := widget.NewEntry(), widget.NewEntry(), widget.NewEntry()
 	status := widget.NewLabel(catalog.Text("status.idle"))
 	status.Wrapping = fyne.TextWrapWord
@@ -72,6 +58,7 @@ func Run(root string, catalog *locales.Catalog, logger *slog.Logger) {
 	picture.FillMode = canvas.ImageFillOriginal
 	picture.ScaleMode = canvas.ImageScalePixels
 	viewport := newQRViewport(picture, w.Canvas(), capacity)
+	control.clear = func() { picture.Image = image.NewRGBA(image.Rect(0, 0, 1, 1)); picture.Refresh(); viewport.Refresh() }
 	windows := localizedSelect(catalog)
 	var sources []platform.Source
 	send := func(kind string) {
@@ -134,10 +121,14 @@ func Run(root string, catalog *locales.Catalog, logger *slog.Logger) {
 	}
 	note := widget.NewLabel(catalog.Text("profile.transport_note"))
 	note.Wrapping = fyne.TextWrapWord
+	controlHint := widget.NewLabel(catalog.Text("control.instructions"))
+	controlHint.Wrapping = fyne.TextWrapWord
 	chooser := &savedChooser{ctx: ctx, state: filepath.Join(root, "state"), catalog: catalog, window: w}
 	chooseSend := func(item storage.SavedTransfer) { enqueueOpen(commands, status, catalog, item.Directory) }
 	chooseReceive := func(item storage.SavedReceive) { selectReceive(item, session, destination, windows) }
 	controls := container.NewVBox(note, profiles.object(), widget.NewLabel(catalog.Text("saved.label")), savedControl,
+		controlHint,
+		widget.NewButton(catalog.Text("action.control_show"), control.arm), controlledReceiveButton(catalog, w, send),
 		widget.NewButton(catalog.Text("action.saved"), func() { chooser.show(false, chooseSend, chooseReceive) }),
 		widget.NewButton(catalog.Text("action.sessions"), func() { chooser.show(true, chooseSend, chooseReceive) }),
 		widget.NewLabel(catalog.Text("source.label")), source,
@@ -149,17 +140,20 @@ func Run(root string, catalog *locales.Catalog, logger *slog.Logger) {
 		container.NewVBox(button("action.previous", "previous"), button("action.next", "next"), button("action.auto", "auto")), status)
 	split := container.NewHSplit(container.NewScroll(controls), viewport)
 	split.SetOffset(0.4)
+	control.install(viewport)
 	w.SetContent(split)
 	desiredSize := fyne.NewSize(1150, 800)
 	w.Resize(initialWindowSize(desiredSize))
 	var closing atomic.Bool
-	w.SetCloseIntercept(func() {
+	control.requestClose = func() {
 		if closing.Swap(true) {
 			return
 		}
 		cancel()
+		control.authorized.Store(false)
 		go func() { <-done; chooser.workers.Wait(); fyne.Do(func() { w.SetCloseIntercept(nil); w.Close() }) }()
-	})
+	}
+	w.SetCloseIntercept(control.requestClose)
 	// One bounded UI delivery at a time; persistence only writes a latest-value mailbox.
 	go func() {
 		ticker := time.NewTicker(dimensionsRefreshInterval)
@@ -169,11 +163,15 @@ func Run(root string, catalog *locales.Catalog, logger *slog.Logger) {
 				profiles.refreshCapacity(capacity)
 				profiles.reconcile(event)
 				w.SetTitle(windowTitle(catalog, event.role, os.Getpid()))
+				event = control.guard(event)
+				control.apply(event)
 				status.SetText(catalog.Text(event.key, event.params))
 				if event.picture != nil {
-					picture.Image = event.picture
-					picture.Refresh()
-					viewport.Refresh()
+					control.paint(event, func() {
+						picture.Image = event.picture
+						picture.Refresh()
+						viewport.Refresh()
+					})
 				}
 				if event.sources != nil {
 					sources = event.sources
@@ -192,8 +190,9 @@ func Run(root string, catalog *locales.Catalog, logger *slog.Logger) {
 				if event.prepared != "" {
 					saved.SetText(event.prepared)
 				}
+				control.acknowledge(event, picture.Image.Bounds(), picture.Visible())
 			})
-		}, func() { fyne.DoAndWait(func() { profiles.refreshCapacity(capacity) }) })
+		}, func() { fyne.DoAndWait(func() { profiles.refreshCapacity(capacity); control.poll() }) })
 	}()
 	w.Show()
 	if err := reconcileInitialWindowSize(w, desiredSize); err != nil {
@@ -288,12 +287,24 @@ func runEngine(ctx context.Context, root string, commands <-chan command, events
 				}
 				continue
 			}
-			if mode != "" && (cmd.kind != "profile" || mode != "auto") {
+			if mode != "" && cmd.kind != "control_show" && cmd.kind != "control_receive" && (cmd.kind != "profile" || mode != "auto") {
 				emit(snapshot{key: "status.busy"})
 				continue
 			}
 			var err error
 			switch cmd.kind {
+			case "control_show":
+				if err = stop(); err == nil {
+					role = "sender"
+					err = runControlledViewer(ctx, prepared, profile, ordinal, commands, emit, io)
+				} else {
+					emit(snapshot{releaseControl: true, key: "status.paused"})
+				}
+			case "control_receive":
+				if err = stop(); err == nil {
+					role = "receiver"
+					err = runControlledReceive(ctx, root, cmd, commands, emit, io)
+				}
 			case "profile":
 				requested := cmd.visual
 				if requested == (application.VisualProfile{}) {

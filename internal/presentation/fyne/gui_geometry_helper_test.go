@@ -44,6 +44,9 @@ type geometryReply struct {
 func init() { nativeGUIHelper = geometryGUIHelper }
 
 func geometryGUIHelper() error {
+	if os.Getenv("RASTERDOCK_RECOVERY_TIMESTAMP_HELPER") == "1" {
+		return recoveryTimestampGUIHelper()
+	}
 	root := os.Getenv("RASTERDOCK_GUI_ROOT")
 	if root == "" {
 		return fmt.Errorf("missing isolated GUI root")
@@ -101,8 +104,13 @@ func geometryDrive(w fyne.Window, request geometryRequest) (r geometryReply) {
 		return
 	}
 	box, ok := scroll.Content.(*fyne.Container)
-	if !ok || len(box.Objects) != 20 {
+	if !ok {
 		r.Error = "unexpected production form structure"
+		return
+	}
+	fields, err := geometryLookupForm(box)
+	if err != nil {
+		r.Error = err.Error()
 		return
 	}
 	profile, ok := box.Objects[1].(*fyne.Container)
@@ -126,24 +134,10 @@ func geometryDrive(w fyne.Window, request geometryRequest) (r geometryReply) {
 		r.Error = "profile labels/options changed"
 		return
 	}
-	// Entries and capture selector are identified by adjacent public labels,
-	// never by selecting the first/last Select in a recursive traversal.
-	entry := func(index int, label string) *widget.Entry {
-		l, ok := box.Objects[index-1].(*widget.Label)
-		if !ok || l.Text != label {
-			return nil
-		}
-		e, _ := box.Objects[index].(*widget.Entry)
-		return e
-	}
-	source := entry(7, "Source file or directory")
-	destination := entry(10, "Destination directory")
-	session := entry(16, "Receive session directory (empty = new session)")
-	windows, wOK := box.Objects[13].(*widget.Select)
-	captureLabel, clOK := box.Objects[12].(*widget.Label)
-	status, sOK := box.Objects[19].(*widget.Label)
+	source, destination, session := fields.source, fields.destination, fields.session
+	windows, status := fields.windows, fields.status
 	viewport, vOK := split.Trailing.(*fyne.Container)
-	if source == nil || destination == nil || session == nil || !wOK || !clOK || captureLabel.Text != "Capture window (OS permission may be required)" || !sOK || !vOK || len(viewport.Objects) != 1 {
+	if !vOK || len(viewport.Objects) != 1 {
 		r.Error = "production entry/capture/viewport structure changed"
 		return
 	}

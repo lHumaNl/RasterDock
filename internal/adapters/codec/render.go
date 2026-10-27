@@ -47,13 +47,14 @@ func RenderPage(d v1.Descriptor, packets []v1.Packet, profile application.ColorP
 
 // RenderVisualPage validates bounded geometry before allocating the canvas.
 func RenderVisualPage(d v1.Descriptor, packets []v1.Packet, profile application.VisualProfile, ordinal, frame, epoch uint64) (*image.RGBA, error) {
+	return renderVisualPage(d, packets, profile, ordinal, LiveState{Frame: frame, Epoch: epoch})
+}
+
+func renderVisualPage(d v1.Descriptor, packets []v1.Packet, profile application.VisualProfile, ordinal uint64, state LiveState) (*image.RGBA, error) {
 	if profile.Capacity() == 0 || uint64(len(packets)) != profile.Capacity() || d.Block > maxBlock {
 		return nil, application.ErrProfile
 	}
-	b := visualBeacon(d, profile, ordinal, frame, epoch)
-	if packets[0].Kind == 1 {
-		b.Phase = 0
-	}
+	b := liveBeacon(d, packets[0], profile, ordinal, state)
 	canvas, err := beaconCanvas(b)
 	if err != nil {
 		return nil, err

@@ -42,6 +42,10 @@ func paint(dst *image.RGBA, text string, version int, origin image.Point) error 
 
 // Decode owns a fresh reader and independently validates CRC and block layout.
 func Decode(img image.Image) (v1.Beacon, []v1.Packet, error) {
+	return decode(img, false)
+}
+
+func decode(img image.Image, controlled bool) (v1.Beacon, []v1.Packet, error) {
 	var beacon v1.Beacon
 	bitmap, err := gozxing.NewBinaryBitmapFromImage(img)
 	if err != nil {
@@ -66,6 +70,9 @@ func Decode(img image.Image) (v1.Beacon, []v1.Packet, error) {
 			if e != nil {
 				continue
 			}
+			if found && controlled {
+				return v1.Beacon{}, nil, ErrAmbiguousControl
+			}
 			if found && b.Descriptor != beacon.Descriptor {
 				return beacon, nil, errors.New("multiple transfers in capture")
 			}
@@ -85,6 +92,9 @@ func Decode(img image.Image) (v1.Beacon, []v1.Packet, error) {
 	}
 	if !found {
 		return beacon, nil, errors.New("RasterDock beacon not found")
+	}
+	if controlled && beacon.Epoch == 0 {
+		return v1.Beacon{}, nil, v1.ErrPacket
 	}
 	if !fixedGeometry(beacon) {
 		return beacon, nil, application.ErrProfile
