@@ -1,6 +1,15 @@
 package platform
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
+
+// ErrInputFocusLost identifies a proven frontmost-app or pinned-window mismatch.
+var ErrInputFocusLost = errors.New("native keyboard input focus lost")
+
+// ErrInputProcessGone identifies loss or replacement of the bound process instance.
+var ErrInputProcessGone = errors.New("native keyboard input process gone")
 
 // InputDiagnosticStage identifies a refusal site, never target data.
 type InputDiagnosticStage int
@@ -82,3 +91,14 @@ func (e *InputDiagnosticError) Error() string {
 }
 
 func (*InputDiagnosticError) Unwrap() error { return ErrInputUnavailable }
+
+// Is categorizes only proven mismatches; unknown AX failures remain generic stops.
+func (e *InputDiagnosticError) Is(target error) bool {
+	if e == nil {
+		return false
+	}
+	if e.Code == InputCodeFrontmost || e.Code == InputCodeFocusIdentity {
+		return target == ErrInputFocusLost
+	}
+	return e.Code == InputCodeProcessStartChanged && target == ErrInputProcessGone
+}

@@ -16,15 +16,15 @@ var (
 )
 
 // InputBinding is an explicitly selected target, not authorization to control it.
-// Callers must independently gate capture freshness and operator consent.
+// Callers must independently gate operator consent and their capture policy.
 type InputBinding interface {
 	Target() ControlTarget
 	Check() error
 	// Send runs eligibility, then a fresh native preflight before EVERY key.
 	// Eligibility need not duplicate observational Check: native authorization is
 	// never cached. The original per-key deadline starts before eligibility, and
-	// includes callback/lock wait time. Native postflight and paired release remain
-	// required; an error can follow partial input and is not proof of zero keys.
+	// includes callback/lock wait time. Native paired release remains required;
+	// no postflight is performed. An error is not proof of zero keys delivered.
 	Send(context.Context, uint64, uint64, func() error) error
 	Close() error
 }
@@ -41,18 +41,30 @@ type RefreshingInputBinding interface {
 	SendWithRefresh(context.Context, uint64, uint64, func(context.Context) error, func() error) error
 }
 
+// FinishingInputBinding sends the terminal F9, decimal nonce, Return sequence once.
+// Every outcome permanently closes the binding before releasing sequence ownership.
+// Both callbacks and a positive nonce are required; the two-second budget includes
+// owner wait. Callbacks follow RefreshingInputBinding's non-reentrancy contract.
+// Native success means a posted pair, not confirmed delivery; there is no final
+// postflight. An error may follow partial delivery. Never retry to confirm delivery.
+type FinishingInputBinding interface {
+	RefreshingInputBinding
+	SendFinishWithRefresh(context.Context, uint64, func(context.Context) error, func() error) error
+}
+
 const (
 	// InputSequenceTimeout matches the control protocol's two-second sequence
 	// limit without importing control core. Legacy Send retains its caller budget.
 	InputSequenceTimeout = 2 * time.Second
-	// InputGuardMargin is the required capture-expiry lookahead in EVERY Send
-	// callback: gate.Check(time.Now().Add(InputGuardMargin)). The adapter rejects
+	// InputGuardMargin is the legacy capture-expiry lookahead for callers retaining
+	// that policy: gate.Check(time.Now().Add(InputGuardMargin)). The adapter rejects
 	// preflight results after inputCheckBudget, including callback/lock wait time.
 	// This is not a real-time OS scheduling or atomic focus/post guarantee.
 	InputGuardMargin          = 150 * time.Millisecond
 	inputCheckBudget          = 100 * time.Millisecond
 	inputSequenceLimit        = 48
 	inputKeyF8         uint16 = 100
+	inputKeyF9         uint16 = 101
 	inputKeyTab        uint16 = 48
 	inputKeyReturn     uint16 = 36
 	inputKeyInterval          = 10 * time.Millisecond
@@ -80,20 +92,22 @@ func inputSequence(nonce, ordinal uint64) ([]uint16, error) {
 	if nonce == 0 {
 		return nil, ErrInputUnavailable
 	}
-	digits := [...]uint16{29, 18, 19, 20, 21, 23, 22, 26, 28, 25}
-	keys := []uint16{inputKeyF8}
-	for _, digit := range strconv.FormatUint(nonce, 10) {
-		keys = append(keys, digits[digit-'0'])
-	}
+	keys := appendInputDigits([]uint16{inputKeyF8}, nonce)
 	keys = append(keys, inputKeyTab)
-	for _, digit := range strconv.FormatUint(ordinal, 10) {
-		keys = append(keys, digits[digit-'0'])
-	}
+	keys = appendInputDigits(keys, ordinal)
 	keys = append(keys, inputKeyReturn)
 	if len(keys) > inputSequenceLimit {
 		return nil, ErrInputUnavailable
 	}
 	return keys, nil
+}
+
+func appendInputDigits(keys []uint16, value uint64) []uint16 {
+	digits := [...]uint16{29, 18, 19, 20, 21, 23, 22, 26, 28, 25}
+	for _, digit := range strconv.FormatUint(value, 10) {
+		keys = append(keys, digits[digit-'0'])
+	}
+	return keys
 }
 
 func (b *inputBinding) stop(err error) error {
@@ -147,6 +161,26 @@ func (b *inputBinding) SendWithRefresh(ctx context.Context, nonce, ordinal uint6
 	ctx, cancel := context.WithTimeout(ctx, InputSequenceTimeout)
 	defer cancel()
 	return b.send(ctx, nonce, ordinal, refresh, eligible)
+}
+
+func (b *inputBinding) SendFinishWithRefresh(ctx context.Context, nonce uint64, refresh func(context.Context) error, eligible func() error) error {
+	if ctx != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, InputSequenceTimeout)
+		defer cancel()
+	}
+	b.owner.Lock()
+	defer b.owner.Unlock()
+	// LIFO is intentional: queued sends must observe permanent stop, even on success.
+	defer func() { _ = b.Close() }()
+	if b.stopped.Load() {
+		return ErrInputStopped
+	}
+	if ctx == nil || nonce == 0 || refresh == nil || eligible == nil {
+		return ErrInputUnavailable
+	}
+	keys := append(appendInputDigits([]uint16{inputKeyF9}, nonce), inputKeyReturn)
+	return b.sendSequence(ctx, keys, refresh, eligible)
 }
 
 func (b *inputBinding) send(ctx context.Context, nonce, ordinal uint64, refresh func(context.Context) error, eligible func() error) error {

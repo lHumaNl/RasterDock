@@ -31,22 +31,22 @@ import (
 func Run(root string, catalog *locales.Catalog, logger *slog.Logger) {
 	a := newTransientApp()
 	w := a.NewWindow(windowTitle(catalog, "idle", os.Getpid()))
+	w.SetMaster() // Timer/idle shutdown closes the application, not merely a window.
 	ctx, cancel := context.WithCancel(context.Background())
 	commands := make(chan command, 8)
 	events := make(chan snapshot, 1)
 	done := make(chan struct{})
 	capacity := &viewportCapacity{}
 	control := &controlUI{window: w, catalog: catalog, commands: commands}
-	control.focusState = func() (bool, uint64) {
-		return platform.OwnWindowFocusState(windowTitle(catalog, "sender", os.Getpid()))
-	}
 	go func() {
 		defer close(done)
-		engine(ctx, root, commands, events, logger, capacity, control.focused, func() { control.authorized.Store(false) })
+		engine(ctx, root, commands, events, logger, capacity, control.authorizedNow, func() { control.authorized.Store(false) })
 	}()
 	source, destination, session := widget.NewEntry(), widget.NewEntry(), widget.NewEntry()
 	status := widget.NewLabel(catalog.Text("status.idle"))
 	status.Wrapping = fyne.TextWrapWord
+	options := newPersistentSenderOptions(catalog, filepath.Join(root, "settings.yaml"))
+	control.readIdleTimeout = options.timeout
 	var profiles *visualControls
 	profiles = newVisualControls(catalog, func(profile application.VisualProfile) {
 		if !profiles.enqueue(commands, profile) {
@@ -70,6 +70,14 @@ func Run(root string, catalog *locales.Catalog, logger *slog.Logger) {
 			}
 		}
 		cmd := command{kind: kind, source: source.Text, destination: destination.Text, session: session.Text, window: id}
+		if kind == "auto" {
+			var err error
+			cmd.cycles, err = options.cycleLimit()
+			if err != nil {
+				dialog.ShowError(err, w)
+				return
+			}
+		}
 		select {
 		case commands <- cmd:
 		default:
@@ -119,6 +127,8 @@ func Run(root string, catalog *locales.Catalog, logger *slog.Logger) {
 	button := func(key, kind string) *widget.Button {
 		return widget.NewButton(catalog.Text(key), func() { send(kind) })
 	}
+	resume := button("action.control_resume", "control_resume")
+	resume.Disable()
 	note := widget.NewLabel(catalog.Text("profile.transport_note"))
 	note.Wrapping = fyne.TextWrapWord
 	controlHint := widget.NewLabel(catalog.Text("control.instructions"))
@@ -127,8 +137,9 @@ func Run(root string, catalog *locales.Catalog, logger *slog.Logger) {
 	chooseSend := func(item storage.SavedTransfer) { enqueueOpen(commands, status, catalog, item.Directory) }
 	chooseReceive := func(item storage.SavedReceive) { selectReceive(item, session, destination, windows) }
 	controls := container.NewVBox(note, profiles.object(), widget.NewLabel(catalog.Text("saved.label")), savedControl,
+		options.object(),
 		controlHint,
-		widget.NewButton(catalog.Text("action.control_show"), control.arm), controlledReceiveButton(catalog, w, send),
+		widget.NewButton(catalog.Text("action.control_show"), control.arm), controlledReceiveButton(catalog, w, send), resume,
 		widget.NewButton(catalog.Text("action.saved"), func() { chooser.show(false, chooseSend, chooseReceive) }),
 		widget.NewButton(catalog.Text("action.sessions"), func() { chooser.show(true, chooseSend, chooseReceive) }),
 		widget.NewLabel(catalog.Text("source.label")), source,
@@ -140,6 +151,8 @@ func Run(root string, catalog *locales.Catalog, logger *slog.Logger) {
 		container.NewVBox(button("action.previous", "previous"), button("action.next", "next"), button("action.auto", "auto")), status)
 	split := container.NewHSplit(container.NewScroll(controls), viewport)
 	split.SetOffset(0.4)
+	control.ctx = ctx
+	control.restore = func() { w.SetContent(split) }
 	control.install(viewport)
 	w.SetContent(split)
 	desiredSize := fyne.NewSize(1150, 800)
@@ -160,12 +173,24 @@ func Run(root string, catalog *locales.Catalog, logger *slog.Logger) {
 		defer ticker.Stop()
 		deliverSnapshots(ctx, events, ticker.C, func(event snapshot) {
 			fyne.DoAndWait(func() {
+				if event.closeApplication {
+					control.requestClose()
+					return
+				}
+				if event.controlOwner != 0 && event.controlOwner != control.owner {
+					return
+				}
 				profiles.refreshCapacity(capacity)
 				profiles.reconcile(event)
 				w.SetTitle(windowTitle(catalog, event.role, os.Getpid()))
 				event = control.guard(event)
 				control.apply(event)
 				status.SetText(catalog.Text(event.key, event.params))
+				if event.canResume {
+					resume.Enable()
+				} else {
+					resume.Disable()
+				}
 				if event.picture != nil {
 					control.paint(event, func() {
 						picture.Image = event.picture
@@ -227,6 +252,10 @@ func runEngine(ctx context.Context, root string, commands <-chan command, events
 	var mode string
 	var ordinal, frame, epoch uint64
 	var playback *presentation.Playback
+	var cycleLimit, cycleNumber uint64
+	var finalApplied chan struct{}
+	finalPresented := false
+	var paused *receiveResume
 	var receive command
 	var calibration calibrationGuard
 	lastLost := io.viewport.load().Lost
@@ -234,6 +263,7 @@ func runEngine(ctx context.Context, root string, commands <-chan command, events
 	// Every terminal transition relinquishes both the receiver and its command.
 	stop := func() error {
 		mode = ""
+		finalApplied, finalPresented = nil, false
 		calibration = calibrationGuard{}
 		receive = command{}
 		var err error
@@ -266,6 +296,14 @@ func runEngine(ctx context.Context, root string, commands <-chan command, events
 		}
 		role = "sender"
 		frame++
+		if mode == "auto" {
+			s.key = "status.timer_frame"
+			s.params["cycle"], s.params["cycles"] = cycleNumber, cycleLimit
+			if playback.CompletedCycles() >= cycleLimit {
+				finalApplied = make(chan struct{}, 1)
+				s.applied = finalApplied
+			}
+		}
 		fitBlocked = false
 		lastLost = observedLoss // Never acknowledge a loss that happened during rendering.
 		emit(s)
@@ -276,6 +314,14 @@ func runEngine(ctx context.Context, root string, commands <-chan command, events
 		case <-ctx.Done():
 			return
 		case cmd := <-commands:
+			if cmd.kind == "control_resume" {
+				if paused == nil {
+					emit(snapshot{key: "control.no_resume"})
+					continue
+				}
+				cmd = paused.command
+				cmd.kind, cmd.resume = "control_receive", paused
+			}
 			if cmd.kind == "profile" {
 				revision = max(revision, cmd.revision)
 			}
@@ -296,14 +342,25 @@ func runEngine(ctx context.Context, root string, commands <-chan command, events
 			case "control_show":
 				if err = stop(); err == nil {
 					role = "sender"
-					err = runControlledViewer(ctx, prepared, profile, ordinal, commands, emit, io)
+					err = runControlledViewer(ctx, prepared, profile, ordinal, cmd.controlOwner, cmd.idleTimeout, commands, emit, io)
+					if errors.Is(err, errSenderIdleTimeout) {
+						emit(snapshot{key: "sender.idle_closed", closeApplication: true})
+						return
+					}
 				} else {
-					emit(snapshot{releaseControl: true, key: "status.paused"})
+					emit(snapshot{releaseControl: true, controlOwner: cmd.controlOwner, key: "status.paused"})
 				}
 			case "control_receive":
+				paused = nil
 				if err = stop(); err == nil {
 					role = "receiver"
 					err = runControlledReceive(ctx, root, cmd, commands, emit, io)
+					var pause *receivePausedError
+					if errors.As(err, &pause) {
+						paused = pause.resume
+						emit(snapshot{key: "control.paused", canResume: true, session: paused.command.session, params: map[string]interface{}{"reason": pause.cause.Error()}})
+						err = nil
+					}
 				}
 			case "profile":
 				requested := cmd.visual
@@ -373,6 +430,15 @@ func runEngine(ctx context.Context, root string, commands <-chan command, events
 				if prepared == nil {
 					err = errors.New("no prepared transfer")
 				} else if err = checkFit(profile, io.viewport); err == nil {
+					cycleLimit = cmd.cycles
+					if cycleLimit == 0 {
+						cycleLimit = defaultTimerCycles
+					}
+					playback, err = presentation.NewVisualPlayback(prepared.ManifestPackets(), prepared.PacketCount(), profile)
+					if err != nil {
+						break
+					}
+					finalApplied, finalPresented = nil, false
 					lastLost = observedLoss
 					mode = "auto"
 				}
@@ -421,6 +487,20 @@ func runEngine(ctx context.Context, root string, commands <-chan command, events
 			}
 			lastLost = space.Lost
 			if mode == "auto" {
+				if playback.CompletedCycles() >= cycleLimit {
+					if finalPresented {
+						emit(snapshot{key: "sender.cycles_closed", closeApplication: true})
+						return
+					}
+					select {
+					case <-finalApplied:
+						finalPresented = true
+						finalApplied = nil
+					default:
+					}
+					continue // Last page remains displayed for a tick after UI acknowledgement.
+				}
+				cycleNumber = playback.CompletedCycles() + 1
 				ordinal = playback.Next()
 				if err := show(); err != nil {
 					fail(err)

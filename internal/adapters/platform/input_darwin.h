@@ -61,9 +61,15 @@ uint64_t rd_input_deadline(uint64_t budget_ns);
 uint64_t rd_input_bind_deadline(uint64_t now);
 uint64_t rd_input_ax_allowance(uint64_t now, uint64_t deadline);
 int rd_input_capability(void);
+// Bind performs full permission, CG/title uniqueness, AX identity and PID/start guards.
 rd_input *rd_input_bind(uint32_t window, rd_input_diagnostic *d);
+// After Bind only PID/start, frontmost PID and retained focused AX equality are checked.
+// Check clears authorization; prepare grants a single-use, deadline-limited pair.
 int rd_input_check(rd_input *binding, rd_input_diagnostic *d);
 int rd_input_prepare(rd_input *binding, uint64_t deadline, rd_input_diagnostic *d);
+// Final gate checks PID/start, frontmost PID and deadline, without another AX query.
+// Focus/post is non-atomic. Success means a posted pair, not delivery or postflight.
+// Remote RDP focus cannot be proven here and remains the operator's responsibility.
 int rd_input_key(rd_input *binding, uint16_t key, rd_input_diagnostic *d);
 #ifdef RD_RECOVERY_TIMESTAMP_PROBE
 // Integration-only fixed baseline factory; never accepts a PID, key, or raw event.

@@ -34,7 +34,7 @@ func TestControlledInitialLayoutAdmission(t *testing.T) {
 	picture.FillMode = canvas.ImageFillOriginal
 	picture.ScaleMode = canvas.ImageScalePixels
 	viewport := newQRViewport(picture, controlledScaledCanvas{w.Canvas()}, capacity)
-	u := &controlUI{window: w, catalog: catalog, focusState: func() (bool, uint64) { return true, 0 }}
+	u := &controlUI{window: w, catalog: catalog}
 	u.authorized.Store(true)
 	u.clear = func() {
 		picture.Image = image.NewRGBA(image.Rect(0, 0, 1, 1))
@@ -60,7 +60,7 @@ func TestControlledInitialLayoutAdmission(t *testing.T) {
 	}
 	v, io := viewerFixture(t)
 	v.lost = initial.Lost
-	io.viewport, io.viewerFocused = capacity, u.focused
+	io.viewport, io.viewerAuthorized = capacity, u.authorizedNow
 	emit := func(s snapshot) {
 		trace("before guard")
 		s = u.guard(s)

@@ -1,5 +1,8 @@
 package fyneui
 
+// Legacy heartbeat-refresh fixture. Production event-driven input never invokes
+// this helper; retained only to exercise historical capture rejection fixtures.
+
 import (
 	"context"
 	"errors"
@@ -16,8 +19,8 @@ const controlRefreshHeadroom = 600 * time.Millisecond
 
 var errControlRefreshDeadline = errors.New("control heartbeat refresh deadline expired")
 
-// Runs on the receiver owner, outside the native key-preflight budget. Only
-// control observations are consumed: data is reacquired after Send returns.
+// Legacy helper retained for acquisition regression tests only. Production
+// receiver key callbacks never call this helper or consume capture frames.
 func refreshControlledObservation(ctx context.Context, gate *control.Receiver, stream captureStream, decode func(image.Image) (v1.Beacon, []v1.Packet, error), checkCapture func() error) (err error) {
 	defer func() {
 		if err != nil {

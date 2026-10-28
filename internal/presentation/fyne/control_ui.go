@@ -1,7 +1,9 @@
 package fyneui
 
 import (
+	"context"
 	"image"
+	"math"
 	"os"
 	"runtime"
 	"sync/atomic"
@@ -18,6 +20,10 @@ import (
 )
 
 type command struct {
+	cycles                             uint64
+	idleTimeout                        time.Duration
+	resume                             *receiveResume
+	controlOwner                       uint64
 	revision                           uint64
 	kind, source, destination, session string
 	window                             uint32
@@ -28,6 +34,10 @@ type command struct {
 }
 
 type snapshot struct {
+	canResume                  bool
+	closeApplication           bool
+	controlOwner               uint64
+	finishedControl            bool
 	revision                   uint64
 	profile                    application.ColorProfile
 	visual                     application.VisualProfile
@@ -44,6 +54,10 @@ type snapshot struct {
 }
 
 type controlUI struct {
+	readIdleTimeout func() (time.Duration, error)
+	ctx             context.Context
+	owner           uint64
+	restore         func()
 	window          fyne.Window
 	catalog         *locales.Catalog
 	commands        chan<- command
@@ -52,27 +66,18 @@ type controlUI struct {
 	immersive       fyne.CanvasObject
 	active          bool
 	clear           func()
-	focusState      func() (bool, uint64)
-	focusGeneration atomic.Uint64
 	quarantine      fyne.CanvasObject
 	quarantined     bool
 	requestClose    func()
 }
 
-func (u *controlUI) focused() bool {
-	if !u.authorized.Load() || u.focusState == nil {
-		return false
-	}
-	focused, generation := u.focusState()
-	if !focused || generation != u.focusGeneration.Load() {
-		u.authorized.Store(false)
-		return false
-	}
-	return true
+func (u *controlUI) authorizedNow() bool {
+	// Local target focus is exclusively the receiver/input adapter's job.
+	return u.authorized.Load()
 }
 
 func (u *controlUI) poll() {
-	if u.active && (u.window.Canvas().Focused() != nil || !u.focused()) {
+	if u.active && !u.authorized.Load() {
 		u.stop()
 	}
 }
@@ -95,33 +100,57 @@ func physicalControlKey(code fyne.HardwareKey) string {
 	if runtime.GOOS != "darwin" {
 		return ""
 	}
-	keys := map[int]string{100: "F8", 48: "Tab", 36: "Return", 53: "Escape",
+	keys := map[int]string{100: "F8", 101: "F9", 48: "Tab", 36: "Return", 53: "Escape",
 		29: "0", 18: "1", 19: "2", 20: "3", 21: "4", 23: "5", 22: "6", 26: "7", 28: "8", 25: "9",
 		82: "0", 83: "1", 84: "2", 85: "3", 86: "4", 87: "5", 88: "6", 89: "7", 91: "8", 92: "9", 76: "Enter"}
 	return keys[code.ScanCode]
 }
 
 func (u *controlUI) key(event *fyne.KeyEvent) {
-	if physicalControlKey(event.Physical) == "F8" && !u.authorized.Load() {
+	key := physicalControlKey(event.Physical)
+	if (key == "F8" || key == "F9") && !u.authorized.Load() {
 		u.enterQuarantine()
 		return
 	}
+	u.controlKey(event, "control_key")
+}
+
+func (u *controlUI) keyUp(event *fyne.KeyEvent) {
+	u.controlKey(event, "control_key_up")
+}
+
+func (u *controlUI) controlKey(event *fyne.KeyEvent, kind string) {
 	if !u.active || !u.authorized.Load() {
 		return
 	}
 	key := physicalControlKey(event.Physical)
-	if key == "Escape" || u.window.Canvas().Focused() != nil || !u.focused() {
+	if key == "Escape" {
 		u.stop()
 		return
 	}
+	if u.window.Canvas().Focused() != nil {
+		return
+	}
 	select {
-	case u.commands <- command{kind: "control_key", physicalKey: key, observed: time.Now()}:
+	case u.commands <- command{kind: kind, controlOwner: u.owner, physicalKey: key, observed: time.Now()}:
 	default:
 		u.stop() // A missing key must never leave a command continuation armed.
 	}
 }
 
 func (u *controlUI) arm() {
+	var idleTimeout time.Duration
+	if u.readIdleTimeout != nil {
+		var err error
+		idleTimeout, err = u.readIdleTimeout()
+		if err != nil {
+			dialog.ShowError(err, u.window)
+			return
+		}
+	}
+	if u.owner == math.MaxUint64 {
+		return
+	}
 	if _, ok := u.window.Canvas().(desktop.Canvas); !ok || runtime.GOOS != "darwin" {
 		return
 	}
@@ -129,27 +158,20 @@ func (u *controlUI) arm() {
 		return
 	}
 	u.window.SetTitle(windowTitle(u.catalog, "sender", os.Getpid()))
-	if !u.authorizeFocus() {
+	if !u.authorize() {
 		u.pending.Store(false)
 		return
 	}
+	u.owner++
 	select {
-	case u.commands <- command{kind: "control_show"}:
+	case u.commands <- command{kind: "control_show", controlOwner: u.owner, idleTimeout: idleTimeout}:
 	default:
 		u.authorized.Store(false)
 		u.pending.Store(false)
 	}
 }
 
-func (u *controlUI) authorizeFocus() bool {
-	if u.focusState == nil {
-		return false
-	}
-	focused, generation := u.focusState()
-	if !focused {
-		return false
-	}
-	u.focusGeneration.Store(generation)
+func (u *controlUI) authorize() bool {
 	u.authorized.Store(true)
 	return true
 }
@@ -161,15 +183,28 @@ func (u *controlUI) install(viewport fyne.CanvasObject) {
 	u.quarantine = newPointerExit(u.catalog.Text("control.quarantine"), u.exitQuarantine)
 	if c, ok := u.window.Canvas().(desktop.Canvas); ok {
 		c.SetOnKeyDown(u.key)
+		c.SetOnKeyUp(u.keyUp)
 	}
 }
 
 func (u *controlUI) apply(s snapshot) {
 	if s.releaseControl {
+		if s.controlOwner != u.owner || !u.pending.Load() {
+			return
+		}
+		finished := s.finishedControl && (u.ctx == nil || u.ctx.Err() == nil) &&
+			u.window != nil && u.window.Canvas().Focused() == nil && u.authorizedNow()
 		u.authorized.Store(false)
 		u.pending.Store(false)
 		if u.clear != nil {
 			u.clear()
+		}
+		if finished && u.restore != nil {
+			u.active, u.quarantined = false, false
+			u.window.Canvas().Unfocus()
+			u.restore()
+			u.window.Canvas().Unfocus()
+			return
 		}
 		u.enterQuarantine()
 	}
@@ -207,7 +242,8 @@ func (u *controlUI) exitQuarantine() {
 
 // Deliberately not Focusable: a late Tab/Enter sequence cannot leave the sink.
 // Fyne does not deliver canvas physical callbacks when ordinary fields have
-// focus. Do not restore those fields in this window: pointer exit closes it.
+// focus. This abort path closes the window; only validated terminal keyup may
+// restore the ordinary form through the separate owner-scoped completion path.
 type pointerExit struct {
 	widget.BaseWidget
 	text string
@@ -229,7 +265,7 @@ func (p *pointerExit) CreateRenderer() fyne.WidgetRenderer {
 func (p *pointerExit) Tapped(*fyne.PointEvent) { p.exit() }
 
 func (u *controlUI) paint(s snapshot, paint func()) {
-	if s.controlled && (!s.publication.valid() || !s.publication.spaceValid() || !u.focused()) {
+	if s.controlled && (!s.publication.valid() || !s.publication.spaceValid() || !u.authorizedNow()) {
 		s.publication.revoke()
 		u.stop()
 		return
@@ -250,7 +286,7 @@ func acknowledgeControl(s snapshot) {
 }
 
 func (u *controlUI) guard(s snapshot) snapshot {
-	if s.controlled && (!s.publication.valid() || !u.focused()) {
+	if s.controlled && (!s.publication.valid() || !u.authorizedNow()) {
 		s.publication.revoke()
 		u.stop()
 		s.picture = image.NewRGBA(image.Rect(0, 0, 1, 1))
@@ -260,7 +296,7 @@ func (u *controlUI) guard(s snapshot) snapshot {
 }
 
 func (u *controlUI) acknowledge(s snapshot, bounds image.Rectangle, visible bool) {
-	if s.controlled && (!s.publication.layoutValid(bounds, visible) || !u.focused()) {
+	if s.controlled && (!s.publication.layoutValid(bounds, visible) || !u.authorizedNow()) {
 		s.publication.revoke()
 		u.stop()
 		return

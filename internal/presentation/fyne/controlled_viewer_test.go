@@ -14,7 +14,7 @@ import (
 
 func viewerFixture(t *testing.T) (*controlledViewer, engineIO) {
 	t.Helper()
-	io := engineIO{viewport: &viewportCapacity{}, viewerFocused: func() bool { return true }}
+	io := engineIO{viewport: &viewportCapacity{}, viewerAuthorized: func() bool { return true }}
 	io.viewport.store(image.Pt(3000, 2000), image.Point{})
 	v, err := newControlledViewer(prepareFixture(t), application.DefaultVisualProfile(application.Monochrome), 0, io)
 	if err != nil {
@@ -59,7 +59,7 @@ func assertControlledFrame(t *testing.T, s snapshot, frame, epoch, nonce uint64)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if b.Frame != frame || b.Epoch != epoch || b.Nonce != nonce || b.Ordinal != nonce || b.Flags != 3 {
+	if b.Frame != frame || b.Epoch != epoch || b.Nonce != nonce || b.Ordinal != nonce || b.Flags != 2 {
 		t.Fatalf("unexpected live beacon: %+v", b)
 	}
 }
@@ -90,7 +90,7 @@ func TestControlledViewerFocusAndFitStop(t *testing.T) {
 			v, io := viewerFixture(t)
 			switch reason {
 			case "focus":
-				io.viewerFocused = func() bool { return false }
+				io.viewerAuthorized = func() bool { return false }
 			case "fit":
 				io.viewport.store(image.Pt(1, 1), image.Point{})
 			case "lost":
@@ -105,7 +105,7 @@ func TestControlledViewerFocusAndFitStop(t *testing.T) {
 
 func TestControlledViewerMissingPreparedReleases(t *testing.T) {
 	var released bool
-	err := runControlledViewer(t.Context(), nil, application.VisualProfile{}, 0, nil, func(s snapshot) { released = s.releaseControl && s.picture != nil }, engineIO{})
+	err := runControlledViewer(t.Context(), nil, application.VisualProfile{}, 0, 0, 0, nil, func(s snapshot) { released = s.releaseControl && s.picture != nil }, engineIO{})
 	if err == nil || !released {
 		t.Fatal("missing source did not restore UI")
 	}
@@ -140,7 +140,7 @@ func TestControlledViewerFocusLossEndsLoop(t *testing.T) {
 	v, io := viewerFixture(t)
 	ticks := make(chan time.Time, 1)
 	var focused atomic.Bool
-	io.ticks, io.viewerFocused = ticks, focused.Load
+	io.ticks, io.viewerAuthorized = ticks, focused.Load
 	done := make(chan error, 1)
 	go func() { done <- v.loop(t.Context(), nil, func(snapshot) { t.Error("published after focus loss") }, io) }()
 	ticks <- time.Now()

@@ -125,8 +125,9 @@ func TestMacOSControlledProduction(t *testing.T) {
 	must("owned source", guard(target.ID))
 	t.Logf("target child PID=%d window=%d; no automatic refocus", child.cmd.Process.Pid, target.ID)
 	child.call(t, geometryRequest{Tap: "Controlled viewer (allow keyboard)"})
-	// NO more helper calls/reads for control after this point. EOF shutdown only.
-	must("native held heartbeat", controlledProductionHold(ctx, target.ID, guard))
+	// No helper control after arming. After receiver/input cleanup only read-only
+	// restoration inspection is allowed, followed by EOF shutdown.
+	must("native static held page", controlledProductionHold(ctx, target.ID, guard))
 	commands := 0
 	deps := engineIO{
 		controlDecode: codec.DecodeControlled,
@@ -150,8 +151,10 @@ func TestMacOSControlledProduction(t *testing.T) {
 			}
 			return &controlledProductionInput{InputBinding: binding, sent: &commands, logf: t.Logf}, nil
 		},
-		openReceive:  anchoredReceive(root),
-		controlDelay: 0, // Child already foreground; GUI handoff explicitly not covered.
+		openReceive: anchoredReceive(root),
+		// Keep a truly static page idle beyond the old one-second heartbeat age
+		// before opening a new capture. This is not a focus action or two-GUI handoff.
+		controlDelay: 1500 * time.Millisecond,
 	}
 	complete := false
 	var published, total uint64
@@ -160,7 +163,10 @@ func TestMacOSControlledProduction(t *testing.T) {
 			published, _ = s.params["published"].(uint64)
 			total, _ = s.params["total"].(uint64)
 		}
-		complete = complete || s.key == "control.complete"
+		complete = complete || s.key == "control.complete" || s.key == "control.complete_finish_unconfirmed"
+		if s.key == "control.complete_finish_unconfirmed" {
+			t.Log("files saved; terminal delivery or cleanup unconfirmed (no retry)")
+		}
 	}, deps)
 	must("production receive", err)
 	if !complete || commands == 0 || published != uint64(len(want)) || total != published {
@@ -173,8 +179,25 @@ func TestMacOSControlledProduction(t *testing.T) {
 			t.Fatal("published bytes/SHA mismatch")
 		}
 	}
+	// Read-only helper inspection is allowed only AFTER receive/input ownership
+	// has ended. It never drives completion or supplies a protocol acknowledgement.
+	awaitControlledRestoration(t, child)
 	child.close(t) // Normal EOF, not a page/control channel.
 	t.Logf("production acceptance complete: completed-command-attempts=%d files=%d duration=%s; no decode oracle, NOT throughput/two-GUI evidence", commands, published, time.Since(started))
+}
+
+func awaitControlledRestoration(t *testing.T, child *geometryChild) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		r := child.call(t, geometryRequest{InspectRestored: true})
+		if r.Restored && r.Unfocused {
+			t.Log("sender settings restored unfocused after terminal Enter release")
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("terminal command did not restore sender settings; no retry")
 }
 
 type controlledProductionInput struct {
@@ -184,6 +207,21 @@ type controlledProductionInput struct {
 	logf     func(string, ...interface{})
 }
 
+func (i *controlledProductionInput) SendFinishWithRefresh(ctx context.Context, nonce uint64, refresh func(context.Context) error, eligible func() error) error {
+	input, ok := i.InputBinding.(platform.FinishingInputBinding)
+	if !ok {
+		return errors.New("native binding lacks terminal completion capability")
+	}
+	i.logf("terminal attempt BEGIN nonce=%d; last sequence, no retry", nonce)
+	err := input.SendFinishWithRefresh(ctx, nonce, refresh, eligible)
+	if err != nil {
+		i.logf("terminal attempt unconfirmed: %v; no retry", err)
+	} else {
+		i.logf("terminal attempt sent; remote restoration checked separately")
+	}
+	return err
+}
+
 func (i *controlledProductionInput) Send(ctx context.Context, nonce, ordinal uint64, eligible func() error) error {
 	return i.attempt(nonce, ordinal, func() error { return i.InputBinding.Send(ctx, nonce, ordinal, eligible) })
 }
@@ -191,7 +229,7 @@ func (i *controlledProductionInput) Send(ctx context.Context, nonce, ordinal uin
 func (i *controlledProductionInput) SendWithRefresh(ctx context.Context, nonce, ordinal uint64, refresh func(context.Context) error, eligible func() error) error {
 	input, ok := i.InputBinding.(platform.RefreshingInputBinding)
 	if !ok {
-		return errors.New("native binding lacks heartbeat refresh capability")
+		return errors.New("native binding lacks bounded command capability")
 	}
 	return i.attempt(nonce, ordinal, func() error { return input.SendWithRefresh(ctx, nonce, ordinal, refresh, eligible) })
 }
@@ -200,7 +238,7 @@ func (i *controlledProductionInput) attempt(nonce, ordinal uint64, send func() e
 	i.attempts++
 	i.logf("command attempt BEGIN attempt=%d nonce=%d ordinal=%d", i.attempts, nonce, ordinal)
 	if err := send(); err != nil {
-		i.logf("command attempt FAILED attempt=%d nonce=%d ordinal=%d; keys/receipt unknown (failure may follow partial input/postflight)", i.attempts, nonce, ordinal)
+		i.logf("command attempt FAILED attempt=%d nonce=%d ordinal=%d; keys/receipt unknown (failure may follow partial input)", i.attempts, nonce, ordinal)
 		return err
 	}
 	*i.sent++ // Completed Send attempts only, not key counts or remote receipts.
@@ -266,7 +304,7 @@ type controlledHeldState struct {
 }
 
 // Shared by the production held check and zero-key diagnostic; decoded payloads
-// and helper state never substitute for captured heartbeat evidence.
+// and helper state never substitute for captured page evidence.
 func (s *controlledHeldState) observe(frame platform.Frame, decoded func(time.Duration)) (bool, error) {
 	if !frame.ControlAgeBounded || frame.Generation == 0 || frame.ControlCapturedAt.IsZero() || time.Since(frame.ControlCapturedAt) < 0 || time.Since(frame.ControlCapturedAt) > time.Second {
 		return false, errors.New("unbounded/stale native acquisition")
@@ -286,15 +324,15 @@ func (s *controlledHeldState) observe(frame platform.Frame, decoded func(time.Du
 }
 
 func (s *controlledHeldState) accept(b v1.Beacon, generation uint64) (bool, error) {
-	if b.Flags != 3 || b.Epoch == 0 || b.Ordinal != 0 || b.Nonce != 0 {
-		return false, errors.New("viewer not armed/focused/held")
+	if b.Flags&2 == 0 || b.Epoch == 0 || b.Ordinal != 0 || b.Nonce != 0 {
+		return false, errors.New("viewer not armed/held")
 	}
 	if b.Colors != 8 || b.Columns != 1 || b.Rows != 1 || b.Module != 4 {
 		return false, errors.New("unexpected native controlled profile")
 	}
 	if s.first.Epoch == 0 {
 		s.first, s.generation = b, generation
-		return false, nil
+		return true, nil // One valid held page; no periodic heartbeat is required.
 	}
 	if b.Epoch != s.first.Epoch || b.Descriptor != s.first.Descriptor || generation != s.generation || b.Frame < s.first.Frame {
 		return false, errors.New("held stream identity/regression")

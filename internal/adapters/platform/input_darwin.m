@@ -3,6 +3,7 @@
 #import <Cocoa/Cocoa.h>
 #import <ApplicationServices/ApplicationServices.h>
 #include <libproc.h>
+#include <sys/proc.h>
 #include <unistd.h>
 #include <time.h>
 #include <limits.h>
@@ -125,7 +126,7 @@ int rd_input_capability(void) {
 static uint64_t process_start(pid_t pid) {
     struct proc_bsdinfo info = {0};
     if (pid <= 0 || pid == getpid() ||
-        proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info)) != sizeof(info)) return 0;
+        proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info)) != sizeof(info) || info.pbi_status == SZOMB) return 0;
     return info.pbi_start_tvsec * 1000000ULL + info.pbi_start_tvusec;
 }
 
@@ -231,26 +232,18 @@ static AXUIElementRef unique_ax_window(rd_input *b, AXUIElementRef app, uint64_t
     return result;
 }
 
-static int focused_title(rd_input *b, AXUIElementRef focused, uint64_t deadline, rd_input_diagnostic *d) {
-    CFStringRef title = ax_value(focused, kAXTitleAttribute, CFStringGetTypeID(), deadline, d, RD_STAGE_AX_TITLE);
-    if (!title) return 0;
-    int ok = CFEqual(title, b->title);
-    CFRelease(title);
-    return ok || refuse(d, RD_STAGE_AX_TITLE, RD_CODE_TITLE);
-}
-
 static int focused_window(rd_input *b, uint64_t deadline, rd_input_diagnostic *d) {
     AXUIElementRef app = AXUIElementCreateApplication(b->pid);
     if (!app) return refuse(d, RD_STAGE_FOCUSED_WINDOW, RD_CODE_ALLOCATION);
     AXUIElementRef focused = (AXUIElementRef)ax_value(app, kAXFocusedWindowAttribute, AXUIElementGetTypeID(), deadline, d, RD_STAGE_FOCUSED_WINDOW);
     int ok = 0;
-    // Post-bind, unrelated AX-only duplicate/unreadable auxiliary windows are
-    // allowed. CG uniqueness remains mandatory; wrong AX focus is never accepted.
-    if (focused && CFEqual(focused, b->axWindow)) ok = focused_title(b, focused, deadline, d);
+    // Bind alone resolves title/CG uniqueness. Live title changes are allowed;
+    // every pair still requires equality with the retained exact AX window.
+    if (focused && CFEqual(focused, b->axWindow)) ok = 1;
     else if (focused) refuse(d, RD_STAGE_FOCUSED_WINDOW, RD_CODE_FOCUS_IDENTITY);
     if (focused) CFRelease(focused);
     CFRelease(app);
-    if (!ok) return 0; // Query/identity/title failure already recorded its first cause.
+    if (!ok) return 0; // Query/identity failure already recorded its first cause.
     return in_budget(deadline) || refuse(d, RD_STAGE_FOCUSED_WINDOW, RD_CODE_BUDGET);
 }
 
@@ -305,10 +298,6 @@ static int local_gate_impl(rd_input *b, uint64_t deadline, rd_input_diagnostic *
     if (!b) return refuse(d, stage, RD_CODE_TARGET_INVALID);
     if (!in_budget(deadline)) return refuse(d, stage, RD_CODE_BUDGET);
     if (process_start(b->pid) != b->start) return refuse(d, stage, RD_CODE_PROCESS_START_CHANGED);
-    CGEventFlags flags = CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState);
-    CGEventFlags forbidden = kCGEventFlagMaskShift | kCGEventFlagMaskControl | kCGEventFlagMaskAlternate |
-        kCGEventFlagMaskCommand | kCGEventFlagMaskAlphaShift | kCGEventFlagMaskSecondaryFn;
-    if (flags & forbidden) return refuse(d, stage, RD_CODE_MODIFIERS);
     if (NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier != b->pid) return refuse(d, stage, RD_CODE_FRONTMOST);
     return in_budget(deadline) || refuse(d, stage, RD_CODE_BUDGET);
 }
@@ -320,21 +309,12 @@ static int local_gate(rd_input *b, uint64_t deadline, rd_input_diagnostic *d, rd
     return ok;
 }
 
-static int prepare_capability(uint64_t deadline) {
-    uint64_t before = timing_begin();
-    int ok = rd_input_capability() && CGPreflightScreenCaptureAccess();
-    timing_end(RD_STAGE_PREPARE, RD_TIMING_CAPABILITY, before, deadline, 0, 0);
-    return ok;
-}
-
 int rd_input_prepare(rd_input *b, uint64_t deadline, rd_input_diagnostic *d) {
     @autoreleasepool {
         if (!b) return refuse(d, RD_STAGE_PREPARE, RD_CODE_TARGET_INVALID);
         b->deadline = 0;
         if (!in_budget(deadline)) return refuse(d, RD_STAGE_PREPARE, RD_CODE_BUDGET);
-        if (!prepare_capability(deadline)) return refuse(d, RD_STAGE_PREPARE, RD_CODE_PERMISSION);
-        if (!local_gate(b, deadline, d, RD_STAGE_LOCAL_FIRST) || !owned_unique_window(b, deadline, d) || !focused_window(b, deadline, d) ||
-            !local_gate(b, deadline, d, RD_STAGE_LOCAL_SECOND)) return 0;
+        if (!local_gate(b, deadline, d, RD_STAGE_LOCAL_FIRST) || !focused_window(b, deadline, d)) return 0;
         b->deadline = deadline;
         return 1;
     }
@@ -368,7 +348,7 @@ static int post_key(rd_input *b, uint16_t key, rd_input_diagnostic *d) {
     usleep(keyHoldMicroseconds);
     CGEventPostToPid(b->pid, up); // Paired release even after cancellation/focus loss.
     CFRelease(down); CFRelease(up);
-    return rd_input_check(b, d);
+    return 1; // Posting is not delivery acknowledgement; no postflight OS queries.
 }
 
 int rd_input_key(rd_input *b, uint16_t key, rd_input_diagnostic *d) {

@@ -15,10 +15,14 @@ import (
 	"rasterdock/internal/adapters/platform"
 	"rasterdock/internal/adapters/storage"
 	"rasterdock/internal/application"
+	"rasterdock/internal/control"
 	v1 "rasterdock/internal/protocol/v1"
 )
 
 type controlledScene struct {
+	finishes                  int
+	finishNonce               uint64
+	finishErr                 error
 	p                         *application.Prepared
 	ordinal, nonce, frame     uint64
 	sends, closes, inputClose int
@@ -66,6 +70,27 @@ func (s *controlledScene) Target() platform.ControlTarget {
 }
 
 type sceneInput struct{ scene *controlledScene }
+
+func (i sceneInput) SendFinishWithRefresh(ctx context.Context, nonce uint64, refresh func(context.Context) error, eligible func() error) error {
+	s := i.scene
+	_, missing, err := s.receiver.NextMissing()
+	if err != nil || missing {
+		return errors.New("finish preceded durable completion")
+	}
+	published, total, err := s.receiver.PublishedFiles()
+	if err != nil || published != total {
+		return errors.New("finish preceded publication")
+	}
+	if err := refresh(ctx); err != nil {
+		return err
+	}
+	if err := eligible(); err != nil {
+		return err
+	}
+	s.finishes++
+	s.finishNonce = nonce
+	return s.finishErr
+}
 
 func (i sceneInput) SendWithRefresh(ctx context.Context, nonce, ordinal uint64, refresh func(context.Context) error, eligible func() error) error {
 	if err := refresh(ctx); err != nil {
@@ -137,7 +162,7 @@ func TestControlledReceiveMultiPageManifestAndPartialPlane(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !complete || s.sends < 2 || s.closes != 1 || s.inputClose != 1 {
+	if !complete || s.sends < 2 || s.finishes != 1 || s.finishNonce <= s.nonce || s.closes != 1 || s.inputClose != 1 {
 		t.Fatalf("incomplete lifecycle: complete=%v sends=%d capture closes=%d input closes=%d", complete, s.sends, s.closes, s.inputClose)
 	}
 	for name, expected := range want {
@@ -232,10 +257,12 @@ func TestControlledReceiveRevocationDuringPersistence(t *testing.T) {
 		}
 		return r, err
 	}
-	completed := false
-	err := runControlledReceive(t.Context(), root, command{window: 1, destination: t.TempDir()}, commands, func(s snapshot) { completed = completed || s.key == "control.complete" }, deps)
-	if !errors.Is(err, context.Canceled) || s.sends != 0 || completed {
-		t.Fatalf("revocation ignored: %v sends=%d complete=%v", err, s.sends, completed)
+	last := snapshot{}
+	err := runControlledReceive(t.Context(), root, command{window: 1, destination: t.TempDir()}, commands, func(v snapshot) { last = v }, deps)
+	// The final captured page was persisted despite cancellation. Report saved
+	// data truthfully, but do not issue the terminal command after revocation.
+	if err != nil || s.sends != 0 || s.finishes != 0 || last.key != "control.complete_finish_unconfirmed" {
+		t.Fatalf("revocation ignored: %v sends=%d finish=%d status=%s", err, s.sends, s.finishes, last.key)
 	}
 }
 
@@ -278,7 +305,7 @@ func (s *staleControlCapture) Next(ctx context.Context) (platform.Frame, error) 
 	return platform.Frame{}, ctx.Err()
 }
 
-func TestControlledReceiveBoundThenStalledCaptureExpires(t *testing.T) {
+func TestControlledReceiveStaticPageExhaustsRetryBudget(t *testing.T) {
 	s := &controlledScene{p: prepareFixture(t)}
 	root := t.TempDir()
 	deps := sceneDependencies(s, root)
@@ -287,11 +314,11 @@ func TestControlledReceiveBoundThenStalledCaptureExpires(t *testing.T) {
 		b, _, err := codec.DecodeControlled(img)
 		return b, nil, err
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	start := time.Now()
 	err := runControlledReceive(ctx, root, command{window: 1, destination: t.TempDir()}, nil, func(snapshot) {}, deps)
-	if err == nil || errors.Is(err, context.DeadlineExceeded) || time.Since(start) > 2*time.Second || s.sends != 1 || s.closes != 1 || s.inputClose != 1 {
+	if !errors.Is(err, control.ErrTimeout) || time.Since(start) > 9*time.Second || s.sends != control.MaxSends || s.closes != 1 || s.inputClose != 1 {
 		t.Fatalf("stale capture retained control: %v elapsed=%v sends=%d closes=%d/%d", err, time.Since(start), s.sends, s.closes, s.inputClose)
 	}
 }
@@ -328,5 +355,37 @@ func TestControlledReceiveRevocationBetweenKeys(t *testing.T) {
 	err := runControlledReceive(t.Context(), root, command{window: 1, destination: t.TempDir()}, commands, func(snapshot) {}, deps)
 	if !errors.Is(err, context.Canceled) || s.sends != 0 {
 		t.Fatalf("continued after mid-send revocation: %v sends=%d", err, s.sends)
+	}
+}
+
+func TestControlledReceiveFiveDecodeFailuresNeverFinish(t *testing.T) {
+	s := &controlledScene{p: prepareFixture(t)}
+	root := t.TempDir()
+	deps := sceneDependencies(s, root)
+	calls := 0
+	deps.controlDecode = func(img image.Image) (v1.Beacon, []v1.Packet, error) {
+		calls++
+		if calls > 1 {
+			return v1.Beacon{}, nil, errInjected
+		}
+		b, _, err := codec.DecodeControlled(img)
+		return b, nil, err
+	}
+	err := runControlledReceive(t.Context(), root, command{window: 1, destination: t.TempDir()}, nil, func(snapshot) {}, deps)
+	if !errors.Is(err, errInjected) || calls != 6 || s.finishes != 0 || s.sends != 1 {
+		t.Fatalf("unsafe undecodable target: %v calls=%d sends=%d finishes=%d", err, calls, s.sends, s.finishes)
+	}
+}
+
+func TestControlledReceiveInitialPendingCaptureBounded(t *testing.T) {
+	s := &controlledScene{p: prepareFixture(t)}
+	root := t.TempDir()
+	deps := sceneDependencies(s, root)
+	deps.controlCapture = func(uint32) (captureStream, error) { return &waitingControlCapture{controlledScene: s}, nil }
+	ctx, cancel := context.WithTimeout(t.Context(), 4*time.Second)
+	defer cancel()
+	err := runControlledReceive(ctx, root, command{window: 1, destination: t.TempDir()}, nil, func(snapshot) {}, deps)
+	if err == nil || errors.Is(err, context.DeadlineExceeded) || s.sends != 0 || s.finishes != 0 {
+		t.Fatalf("initial scan unbounded: %v", err)
 	}
 }

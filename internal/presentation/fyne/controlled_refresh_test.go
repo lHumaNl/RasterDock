@@ -65,16 +65,16 @@ func TestControlledRefreshAcceptsNewHeartbeat(t *testing.T) {
 	}
 }
 
-func TestControlledRefreshRejectsExpiredOldObservation(t *testing.T) {
+func TestLegacyRefreshAcceptsNewAcquisitionAfterStaticPage(t *testing.T) {
 	g, b := refreshGate(t, 700*time.Millisecond)
 	b.Frame++
 	s := &refreshCapture{next: func(context.Context) (platform.Frame, error) { return refreshFrame(), nil }}
 	err := refreshControlledObservation(t.Context(), g, s, func(image.Image) (v1.Beacon, []v1.Packet, error) {
-		time.Sleep(350 * time.Millisecond) // Decode crosses the old authority expiry.
+		time.Sleep(350 * time.Millisecond) // Only incoming acquisition age matters.
 		return b, nil, nil
 	}, func() error { return nil })
-	if !errors.Is(err, control.ErrIneligible) || !g.FreshUntil().IsZero() {
-		t.Fatalf("expired authority revived: %v", err)
+	if err != nil || g.FreshUntil().IsZero() {
+		t.Fatalf("valid acquisition rejected: %v", err)
 	}
 }
 
@@ -172,7 +172,7 @@ func (i *slowRefreshingInput) SendWithRefresh(ctx context.Context, nonce, ordina
 	return i.Send(ctx, nonce, ordinal, eligible)
 }
 
-func TestControlledReceiveRefreshesLongSequenceWithoutPersisting(t *testing.T) {
+func TestControlledReceiveLongSequenceWithoutPerKeyCapture(t *testing.T) {
 	s := &controlledScene{p: prepareFixture(t)}
 	i := &slowRefreshingInput{sceneInput: sceneInput{s}}
 	root := t.TempDir()
@@ -191,7 +191,7 @@ func TestControlledReceiveRefreshesLongSequenceWithoutPersisting(t *testing.T) {
 	defer cancel()
 	complete := false
 	err := runControlledReceive(ctx, root, command{window: 1, destination: t.TempDir()}, nil, func(s snapshot) { complete = complete || s.key == "control.complete" }, deps)
-	if err != nil || !complete || i.keys != 8 || s.sends != 1 || s.frame < 4 {
+	if err != nil || !complete || i.keys != 8 || s.sends != 1 || s.frame != 2 {
 		t.Fatalf("long sequence: %v complete=%v keys=%d commands=%d frames=%d", err, complete, i.keys, s.sends, s.frame)
 	}
 }

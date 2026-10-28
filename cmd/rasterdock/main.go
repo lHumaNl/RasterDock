@@ -24,6 +24,10 @@ func main() {
 	}
 }
 func run() error {
+	return runWithGUI(fyneui.Run)
+}
+
+func runWithGUI(launch func(string, *locales.Catalog, *slog.Logger)) error {
 	root, err := config.Root()
 	if err != nil {
 		return err
@@ -40,7 +44,10 @@ func run() error {
 	logger.Info("startup", "version", buildinfo.Version, "commit", buildinfo.Commit, "build_time", buildinfo.BuildTime, "os", runtime.GOOS, "arch", runtime.GOARCH)
 	settings, err := config.LoadSettings(filepath.Join(root, "settings.yaml"))
 	if err != nil {
-		return err
+		// Preferences errors must not prevent the GUI from showing its persistent
+		// inline warning. No defaults are written over the unreadable/invalid file.
+		logger.Warn("settings_load_failed", "error", err)
+		settings = config.DefaultSettings()
 	}
 	language := settings.Language
 	if language == "system" {
@@ -54,6 +61,6 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	fyneui.Run(root, catalog, logger)
+	launch(root, catalog, logger)
 	return nil
 }

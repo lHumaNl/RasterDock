@@ -6,7 +6,10 @@ import "rasterdock/internal/application"
 const metadataInterval = 10 // Data pages, not logical packets.
 
 // Playback repeats metadata during each data cycle without changing packet identities.
-type Playback struct{ metadata, total, cursor, repeated, since, capacity uint64 }
+type Playback struct{ metadata, total, cursor, repeated, since, capacity, completedCycles uint64 }
+
+// CompletedCycles returns the number of completed wraps of the main playback cursor.
+func (p *Playback) CompletedCycles() uint64 { return p.completedCycles }
 
 // NewPlayback starts with the entire manifest.
 func NewPlayback(metadata, total uint64) *Playback {
@@ -53,5 +56,8 @@ func (p *Playback) advance() {
 	if p.cursor >= p.total {
 		p.cursor = 0
 		p.since = 0
+		if p.completedCycles < ^uint64(0) {
+			p.completedCycles++
+		}
 	}
 }

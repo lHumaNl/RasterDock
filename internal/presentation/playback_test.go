@@ -96,6 +96,75 @@ func assertEightRecurrence(t *testing.T, metadata uint64) {
 	}
 }
 
+func TestPlaybackCountsCompletedCycles(t *testing.T) {
+	tests := []struct {
+		name            string
+		metadata, total uint64
+	}{
+		{name: "partial final page", metadata: 2, total: 11},
+		{name: "metadata only", metadata: 5, total: 5},
+		{name: "metadata repeats", metadata: 2, total: 40},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := NewPlayback(tc.metadata, tc.total)
+			for attempts := 0; attempts < 200 && p.CompletedCycles() < 3; attempts++ {
+				p.Next()
+			}
+			if got := p.CompletedCycles(); got != 3 {
+				t.Fatalf("completed cycles: got %d want 3", got)
+			}
+		})
+	}
+}
+
+func TestPlaybackPartialPageCycleBoundary(t *testing.T) {
+	p, err := NewPagePlayback(2, 11, application.Colors8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 12 {
+		if got, want := p.Next(), uint64(i%4)*3; got != want {
+			t.Fatal(got, want)
+		}
+		if got, want := p.CompletedCycles(), uint64(i+1)/4; got != want {
+			t.Fatal("wrong cycle boundary", got, want)
+		}
+	}
+}
+
+func TestPlaybackMetadataInsertionDoesNotCountCycle(t *testing.T) {
+	p := NewPlayback(2, 100)
+	for range 12 {
+		p.Next()
+	}
+	if p.Next() != 0 || p.CompletedCycles() != 0 {
+		t.Fatal("metadata insertion counted as a full cycle")
+	}
+	if p.Next() != 12 {
+		t.Fatal("metadata insertion advanced the main cursor")
+	}
+}
+
+func TestPlaybackEmptyTotalDoesNotCompleteCycles(t *testing.T) {
+	p := NewPlayback(3, 0)
+	for range 10 {
+		p.Next()
+	}
+	if got := p.CompletedCycles(); got != 0 {
+		t.Fatalf("empty playback completed %d cycles", got)
+	}
+}
+
+func TestPlaybackCycleCountSaturates(t *testing.T) {
+	p := NewPlayback(0, 1)
+	p.completedCycles = ^uint64(0)
+	p.Next()
+	if got := p.CompletedCycles(); got != ^uint64(0) {
+		t.Fatalf("cycle count wrapped: %d", got)
+	}
+}
+
 // A boundary page is a data page too; inserted metadata never skips the data cursor.
 func eightRecurrence(metadata uint64) []uint64 {
 	var ordinals []uint64

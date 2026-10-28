@@ -25,7 +25,6 @@ import (
 
 	"rasterdock/internal/adapters/codec"
 	"rasterdock/internal/adapters/platform"
-	v1 "rasterdock/internal/protocol/v1"
 )
 
 type productionCaptureIdentity interface {
@@ -68,7 +67,7 @@ func TestMacOSControlledCaptureOnly(t *testing.T) {
 	default:
 	}
 	t.Logf("capture-only target PID=%d window=%d; no input binding or OS keys", pinned.PID, pinned.Window)
-	captureOnlyHeartbeats(ctx, t, stream, identity)
+	captureOnlyStaticPage(ctx, t, stream, identity)
 	if identity.Target() != pinned {
 		t.Fatal("capture target changed during acquisition")
 	}
@@ -118,7 +117,7 @@ func TestMacOSControlledCaptureOnly(t *testing.T) {
 	if !errors.Is(err, platform.ErrStreamClosed) {
 		t.Fatal("Next after Close must report stream closed")
 	}
-	t.Log("capture-only qualification complete: three held heartbeats, timestamp bounds, owned target, source-close revocation, idempotent teardown; no keyboard/idle/sleep/fault claims")
+	t.Log("capture-only qualification complete: static held page, timestamp bounds, owned target, source-close revocation, idempotent teardown; no keyboard/sleep/fault claims")
 }
 
 func captureOnlyProductionSender(ctx context.Context, t *testing.T) (*geometryChild, platform.Source, string) {
@@ -167,16 +166,13 @@ func captureOnlyProductionSender(ctx context.Context, t *testing.T) (*geometryCh
 	return child, target, prepared.Title
 }
 
-func captureOnlyHeartbeats(ctx context.Context, t *testing.T, stream platform.Stream, identity productionCaptureIdentity) {
+func captureOnlyStaticPage(ctx context.Context, t *testing.T, stream platform.Stream, identity productionCaptureIdentity) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	var first, last v1.Beacon
-	var generation uint64
-	var previous time.Time
-	for count := 0; count < 3; {
+	for {
 		if ctx.Err() != nil {
-			t.Fatal("three held heartbeats not observed within 10s")
+			t.Fatal("static held page not observed within 10s")
 		}
 		if err := identity.CheckControlAge(); err != nil {
 			t.Fatalf("native control clock guard failed: %v", err)
@@ -192,32 +188,17 @@ func captureOnlyHeartbeats(ctx context.Context, t *testing.T, stream platform.St
 		if !frame.ControlAgeBounded || frame.Generation == 0 || frame.ControlCapturedAt.IsZero() || frame.ControlCapturedAt.After(now) || now.Sub(frame.ControlCapturedAt) > time.Second {
 			t.Fatal("native acquisition lacks fresh bounded timestamp/generation")
 		}
-		if !previous.IsZero() && !frame.ControlCapturedAt.After(previous) {
-			t.Fatal("native acquisition timestamp did not increase")
-		}
-		previous = frame.ControlCapturedAt
 		b, _, err := codec.DecodeControlled(frame.Image)
 		if err != nil {
-			if count == 0 && !errors.Is(err, codec.ErrAmbiguousControl) {
+			if !errors.Is(err, codec.ErrAmbiguousControl) {
 				continue // Bounded initial rendering wait only.
 			}
 			t.Fatal("controlled beacon decode failed")
 		}
-		if b.Flags != 3 || b.Epoch == 0 || b.Ordinal != 0 || b.Nonce != 0 || b.Colors != 8 || b.Columns != 1 || b.Rows != 1 || b.Module != 4 {
-			t.Fatal("unexpected held/armed/focused controlled beacon")
+		if b.Flags&2 == 0 || b.Epoch == 0 || b.Ordinal != 0 || b.Nonce != 0 || b.Colors != 8 || b.Columns != 1 || b.Rows != 1 || b.Module != 4 {
+			t.Fatal("unexpected held/armed controlled beacon")
 		}
-		if count == 0 {
-			first, generation = b, frame.Generation
-		} else {
-			if b.Epoch != first.Epoch || b.Descriptor != first.Descriptor || frame.Generation != generation || b.Frame < last.Frame {
-				t.Fatal("heartbeat identity or counter regressed")
-			}
-			if b.Frame == last.Frame {
-				continue // Native redraw is not evidence of another heartbeat.
-			}
-		}
-		last = b
-		count++
+		t.Logf("native static held page verified: ordinal=%d frame=%d generation=%d", b.Ordinal, b.Frame, frame.Generation)
+		return
 	}
-	t.Logf("three native held heartbeats verified: ordinal=%d frame=%d->%d generation=%d", first.Ordinal, first.Frame, last.Frame, generation)
 }

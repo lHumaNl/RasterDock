@@ -19,7 +19,7 @@ type captureStream interface {
 	Close() error
 }
 
-func engine(ctx context.Context, root string, commands <-chan command, events chan snapshot, logger *slog.Logger, capacity *viewportCapacity, viewerFocused func() bool, viewerRevoke func()) {
+func engine(ctx context.Context, root string, commands <-chan command, events chan snapshot, logger *slog.Logger, capacity *viewportCapacity, viewerAuthorized func() bool, viewerRevoke func()) {
 	tick := time.NewTicker(200 * time.Millisecond)
 	defer tick.Stop()
 	runEngine(ctx, root, commands, events, logger, engineIO{
@@ -27,7 +27,7 @@ func engine(ctx context.Context, root string, commands <-chan command, events ch
 		decode: codec.Decode, openReceive: anchoredReceive(root),
 		controlDecode: codec.DecodeControlled, bindInput: platform.BindInput,
 		controlCapture: func(id uint32) (captureStream, error) { return platform.OpenControlCapture(id) },
-		controlDelay:   3 * time.Second, viewerFocused: viewerFocused,
+		controlDelay:   3 * time.Second, viewerAuthorized: viewerAuthorized,
 		viewerRevoke: viewerRevoke,
 	})
 }
@@ -43,18 +43,18 @@ type receiveOwner interface {
 
 // Per-engine boundaries keep tests headless without mutable package-level hooks.
 type engineIO struct {
-	controlCapture func(uint32) (captureStream, error)
-	controlDecode  func(image.Image) (v1.Beacon, []v1.Packet, error)
-	bindInput      func(uint32) (platform.InputBinding, error)
-	controlDelay   time.Duration
-	viewerFocused  func() bool
-	viewerRevoke   func()
-	observer       engineObserver
-	viewport       *viewportCapacity
-	ticks          <-chan time.Time
-	openCapture    func(uint32) (captureStream, error)
-	decode         func(image.Image) (v1.Beacon, []v1.Packet, error)
-	openReceive    func(string, string, v1.Descriptor) (receiveOwner, error)
+	controlCapture   func(uint32) (captureStream, error)
+	controlDecode    func(image.Image) (v1.Beacon, []v1.Packet, error)
+	bindInput        func(uint32) (platform.InputBinding, error)
+	controlDelay     time.Duration
+	viewerAuthorized func() bool
+	viewerRevoke     func()
+	observer         engineObserver
+	viewport         *viewportCapacity
+	ticks            <-chan time.Time
+	openCapture      func(uint32) (captureStream, error)
+	decode           func(image.Image) (v1.Beacon, []v1.Packet, error)
+	openReceive      func(string, string, v1.Descriptor) (receiveOwner, error)
 }
 
 type fitError struct{ required, available image.Point }
@@ -106,7 +106,10 @@ func emitObservedSnapshot(events chan snapshot, s snapshot, observer engineObser
 	}
 	select {
 	case pending := <-events:
-		s.releaseControl = s.releaseControl || pending.releaseControl
+		s.closeApplication = s.closeApplication || pending.closeApplication
+		if !s.releaseControl && pending.releaseControl && (s.controlOwner == 0 || s.controlOwner == pending.controlOwner) {
+			s.releaseControl, s.finishedControl, s.controlOwner = true, pending.finishedControl, pending.controlOwner
+		}
 		if s.picture == nil && s.visual == pending.visual && s.role == pending.role {
 			s.picture = pending.picture
 			s.pictureID = pending.pictureID
@@ -114,6 +117,9 @@ func emitObservedSnapshot(events chan snapshot, s snapshot, observer engineObser
 			s.controlled = pending.controlled
 			s.publication = pending.publication
 			s.viewportLost = pending.viewportLost
+			if s.controlled {
+				s.controlOwner = pending.controlOwner
+			}
 		}
 		observer.record("mailbox.replace", s.pictureID, pending.pictureID, nil)
 	default:

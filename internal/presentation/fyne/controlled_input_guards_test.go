@@ -105,7 +105,13 @@ func testControlledCallbackGuard(t *testing.T, failure string) {
 	deps := guardDependencies(s, root, i)
 	deps.controlCapture = func(uint32) (captureStream, error) { return capture, nil }
 	err := runControlledReceive(ctx, root, command{window: 1, destination: t.TempDir()}, commands, func(snapshot) {}, deps)
-	if err == nil || !strings.Contains(err.Error(), "control.send: control.key_") || i.keys != 0 || i.callbacks != 1 || i.checks != 3 {
+	// Only operator/context checks belong in callbacks; capture/title/clock
+	// validation is deliberately excluded from the native per-key time budget.
+	wantKeys, wantCallbacks := 5, 5
+	if failure == "command" || failure == "context" {
+		wantKeys, wantCallbacks = 0, 1
+	}
+	if err == nil || !strings.Contains(err.Error(), "control.send:") || i.keys != wantKeys || i.callbacks != wantCallbacks || i.checks != 3 {
 		t.Fatalf("err=%v keys=%d callbacks=%d checks=%d", err, i.keys, i.callbacks, i.checks)
 	}
 }

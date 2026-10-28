@@ -26,13 +26,16 @@ import (
 // data cross this boundary. All actions use production widgets on the UI thread.
 type geometryAction struct{ Control, Value string }
 type geometryRequest struct {
-	InspectSender       bool
-	Source, Destination *string
-	Tap, SelectTitle    string
-	Actions             []geometryAction
-	Viewport            image.Point // Desired physical area; resize only this helper's window.
+	TimerCycles, IdleSeconds *string
+	InspectRestored          bool
+	InspectSender            bool
+	Source, Destination      *string
+	Tap, SelectTitle         string
+	Actions                  []geometryAction
+	Viewport                 image.Point // Desired physical area; resize only this helper's window.
 }
 type geometryReply struct {
+	Restored, Unfocused                                 bool
 	RenderedProfile                                     [4]int // colors, module, columns, rows; never payload/descriptor data
 	Title, Status, Session, Selected, Dimensions, Error string
 	Colors, Module, Grid                                string
@@ -94,6 +97,9 @@ func geometryGUIHelper() error {
 
 func geometryDrive(w fyne.Window, request geometryRequest) (r geometryReply) {
 	split, ok := w.Content().(*container.Split)
+	if request.InspectRestored {
+		return geometryReply{Restored: ok, Unfocused: w.Canvas().Focused() == nil}
+	}
 	if !ok {
 		r.Error = "production content is not Split"
 		return
@@ -112,6 +118,12 @@ func geometryDrive(w fyne.Window, request geometryRequest) (r geometryReply) {
 	if err != nil {
 		r.Error = err.Error()
 		return
+	}
+	if request.TimerCycles != nil || request.IdleSeconds != nil {
+		if err := geometrySetSenderOptions(box, request.TimerCycles, request.IdleSeconds); err != nil {
+			r.Error = err.Error()
+			return
+		}
 	}
 	profile, ok := box.Objects[1].(*fyne.Container)
 	if !ok || len(profile.Objects) != 6 {
@@ -229,4 +241,37 @@ func geometryDrive(w fyne.Window, request geometryRequest) (r geometryReply) {
 		r.RenderedProfile = [4]int{int(beacon.Colors), int(beacon.Module), int(beacon.Columns), int(beacon.Rows)}
 	}
 	return
+}
+
+func geometrySetSenderOptions(box *fyne.Container, cycles, idle *string) error {
+	values := map[string]*string{"Timer cycles before closing (1–1000000)": cycles,
+		"Controlled sender idle timeout, seconds (0 = off, max 86400)": idle}
+	for label, value := range values {
+		if value == nil {
+			continue
+		}
+		var found *widget.Entry
+		for _, object := range box.Objects {
+			group, ok := object.(*fyne.Container)
+			if !ok {
+				continue
+			}
+			for i, item := range group.Objects {
+				text, ok := item.(*widget.Label)
+				if !ok || text.Text != label || i+1 >= len(group.Objects) {
+					continue
+				}
+				entry, ok := group.Objects[i+1].(*widget.Entry)
+				if !ok || found != nil {
+					return fmt.Errorf("ambiguous sender option")
+				}
+				found = entry
+			}
+		}
+		if found == nil {
+			return fmt.Errorf("missing sender option")
+		}
+		found.SetText(*value)
+	}
+	return nil
 }

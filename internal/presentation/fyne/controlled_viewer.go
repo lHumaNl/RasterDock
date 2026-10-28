@@ -18,6 +18,8 @@ import (
 const controlApplyTimeout = time.Second
 
 var errViewerStopped = errors.New("controlled viewer authorization or viewport lost")
+var errViewerFinished = errors.New("controlled viewer received terminal completion")
+var errSenderIdleTimeout = errors.New("controlled sender idle timeout")
 
 // A publication is a revocable lease, not permission for a queued callback to
 // paint indefinitely. Layout eligibility is rechecked on the UI thread.
@@ -71,6 +73,9 @@ func (p *controlPublication) spaceValid() bool {
 }
 
 type controlledViewer struct {
+	idleTimeout   time.Duration
+	lastCommandAt time.Time
+	owner         uint64
 	prepared      *application.Prepared
 	profile       application.VisualProfile
 	ordinal, lost uint64
@@ -92,7 +97,7 @@ func newControlledViewer(p *application.Prepared, profile application.VisualProf
 		return nil, errors.New("invalid viewer epoch")
 	}
 	return &controlledViewer{prepared: p, profile: profile, ordinal: ordinal, lost: io.viewport.load().Lost,
-		started: time.Now(), state: codec.LiveState{Epoch: epoch, Focused: true, Armed: true}}, nil
+		started: time.Now(), lastCommandAt: time.Now(), state: codec.LiveState{Epoch: epoch, Armed: true}}, nil
 }
 
 func awaitControlApply(ctx context.Context, s snapshot, emit func(snapshot)) error {
@@ -119,7 +124,7 @@ func awaitControlApply(ctx context.Context, s snapshot, emit func(snapshot)) err
 }
 
 func (v *controlledViewer) eligible(io engineIO) error {
-	if io.viewerFocused == nil || !io.viewerFocused() || io.viewport.load().Lost != v.lost {
+	if io.viewerAuthorized == nil || !io.viewerAuthorized() || io.viewport.load().Lost != v.lost {
 		return errViewerStopped
 	}
 	return checkFit(v.profile, io.viewport)
@@ -161,7 +166,10 @@ func (v *controlledViewer) nextState(nonce uint64, io engineIO) (codec.LiveState
 }
 
 func (v *controlledViewer) key(ctx context.Context, cmd command, emit func(snapshot), io engineIO) error {
-	if cmd.observed.Before(v.started) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if cmd.controlOwner != v.owner || cmd.observed.Before(v.started) {
 		return nil
 	}
 	if err := v.eligible(io); err != nil {
@@ -174,6 +182,7 @@ func (v *controlledViewer) key(ctx context.Context, cmd command, emit func(snaps
 		if err := v.publish(ctx, request.Ordinal, request.Nonce, emit, io); err != nil {
 			return err
 		}
+		v.lastCommandAt = time.Now()
 	}
 	v.parser = next
 	if accepted && request.Nonce == math.MaxUint64 {
@@ -182,19 +191,65 @@ func (v *controlledViewer) key(ctx context.Context, cmd command, emit func(snaps
 	return nil
 }
 
-func runControlledViewer(ctx context.Context, p *application.Prepared, profile application.VisualProfile, ordinal uint64, commands <-chan command, emit func(snapshot), io engineIO) error {
-	defer emit(snapshot{key: "status.paused", releaseControl: true, picture: image.NewRGBA(image.Rect(0, 0, 1, 1))})
+func (v *controlledViewer) keyUp(ctx context.Context, cmd command, io engineIO) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if cmd.controlOwner != v.owner || cmd.observed.Before(v.started) {
+		return nil
+	}
+	if err := v.eligible(io); err != nil {
+		return err
+	}
+	if _, finished := v.parser.Release(cmd.physicalKey, cmd.observed); finished {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := v.eligible(io); err != nil {
+			return err
+		}
+		return errViewerFinished
+	}
+	return nil
+}
+
+func runControlledViewer(ctx context.Context, p *application.Prepared, profile application.VisualProfile, ordinal, owner uint64, idleTimeout time.Duration, commands <-chan command, emit func(snapshot), io engineIO) error {
+	finished := false
+	defer func() {
+		key := "status.paused"
+		if finished && ctx.Err() == nil {
+			key = "control.sender_finished"
+		} else {
+			finished = false
+		}
+		emit(snapshot{key: key, releaseControl: true, finishedControl: finished, controlOwner: owner, picture: image.NewRGBA(image.Rect(0, 0, 1, 1))})
+	}()
 	v, err := newControlledViewer(p, profile, ordinal, io)
 	if err != nil {
 		return err
 	}
-	if err = v.openSurface(ctx, emit, io); err != nil {
+	v.owner = owner
+	v.idleTimeout = idleTimeout
+	output := func(s snapshot) { s.controlOwner = owner; emit(s) }
+	if err = v.openSurface(ctx, output, io); err != nil {
 		return err
 	}
-	if err = v.publish(ctx, ordinal, 0, emit, io); err != nil {
+	if err = v.publish(ctx, ordinal, 0, output, io); err != nil {
 		return err
 	}
-	return v.loop(ctx, commands, emit, io)
+	v.lastCommandAt = time.Now()
+	err = v.loop(ctx, commands, output, io)
+	if errors.Is(err, errViewerFinished) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := v.eligible(io); err != nil {
+			return err
+		}
+		finished = true
+		return nil
+	}
+	return err
 }
 
 func (v *controlledViewer) openSurface(ctx context.Context, emit func(snapshot), io engineIO) error {
@@ -209,16 +264,35 @@ func (v *controlledViewer) loop(ctx context.Context, commands <-chan command, em
 		case <-ctx.Done():
 			return ctx.Err()
 		case cmd, ok := <-commands:
-			if !ok || cmd.kind != "control_key" {
+			if !ok || (cmd.kind != "control_key" && cmd.kind != "control_key_up") {
 				return nil
+			}
+			if cmd.kind == "control_key_up" {
+				if err := v.keyUp(ctx, cmd, io); err != nil {
+					return err
+				}
+				continue
 			}
 			if err := v.key(ctx, cmd, emit, io); err != nil {
 				return err
 			}
 		case <-io.ticks:
-			if err := v.publish(ctx, v.ordinal, v.state.Nonce, emit, io); err != nil {
+			if err := v.waiting(ctx, io); err != nil {
 				return err
 			}
 		}
 	}
+}
+
+func (v *controlledViewer) waiting(ctx context.Context, io engineIO) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := v.eligible(io); err != nil {
+		return err
+	}
+	if v.idleTimeout > 0 && time.Since(v.lastCommandAt) >= v.idleTimeout {
+		return errSenderIdleTimeout
+	}
+	return nil
 }

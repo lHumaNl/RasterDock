@@ -15,7 +15,7 @@ const (
 	FirstBackoff  = 250 * time.Millisecond
 	SecondBackoff = 500 * time.Millisecond
 	MaxSends      = 3
-	focusArmed    = 3
+	focusArmed    = 2 // Sender focus is not keyboard authority; only armed matters.
 	phasePaused   = 2
 )
 
@@ -31,6 +31,7 @@ var (
 	ErrSendState      = errors.New("invalid control send completion")
 	ErrTimeout        = errors.New("control echo send budget exhausted")
 	ErrNative         = errors.New("native input eligibility checker required")
+	ErrTerminal       = errors.New("control finish already reserved")
 )
 
 // Observation must contain a protocol-validated Beacon. CapturedAt is acquisition
@@ -52,6 +53,8 @@ type Pending struct {
 	IssuedAt, Deadline, RetryAt time.Time
 	Attempts                    int
 	AwaitingSent                bool
+	firstReservation            time.Time
+	baselineFrame               uint64
 }
 
 // Receiver is a synchronous, single-owner gate. Zero value is unbound. It never
@@ -64,12 +67,13 @@ type Receiver struct {
 	confirmed  Command
 	pending    *Pending
 	reservedAt time.Time
+	finishing  bool
 }
 
 // Bind explicitly authorizes a validated descriptor/epoch/source snapshot.
 // now is the binding cutoff: queued captures at or before now are excluded from
 // subsequent Observe calls. The supplied current snapshot alone seeds highwater
-// and freshness. Drain/reacquire as needed; do not use decode time as capture time.
+// and acquisition provenance. Do not use decode time as capture time.
 // A failed bind also revokes the previous binding.
 func (r *Receiver) Bind(pinned v1.Descriptor, o Observation, now time.Time) error {
 	r.Stop()
@@ -83,6 +87,7 @@ func (r *Receiver) Bind(pinned v1.Descriptor, o Observation, now time.Time) erro
 		return ErrExhausted
 	}
 	r.bound, r.current, r.cutoff = true, o, now
+	r.finishing = false
 	r.next = o.Beacon.Nonce + 1
 	r.confirmed = Command{o.Beacon.Nonce, o.Beacon.Ordinal}
 	return nil
@@ -94,7 +99,7 @@ func (r *Receiver) Stop() { r.bound = false; r.pending = nil }
 
 // FreshUntil returns the accepted capture's inclusive freshness boundary, or zero
 // when unbound. It neither mutates state nor authorizes input; use Check with the
-// actual current time, including after capture/decode and before Observe.
+// actual current time. Static-page age is not an authorization deadline.
 func (r *Receiver) FreshUntil() time.Time {
 	if !r.bound {
 		return time.Time{}
@@ -109,17 +114,16 @@ func fresh(o Observation, now time.Time) bool {
 }
 
 func eligible(o Observation, now time.Time) bool {
-	return fresh(o, now) && o.Beacon.Epoch != 0 && o.Beacon.Flags == focusArmed && o.Beacon.Phase <= phasePaused
+	return fresh(o, now) && o.Beacon.Epoch != 0 && o.Beacon.Flags&focusArmed != 0 && o.Beacon.Phase <= phasePaused
 }
 
-// Check validates current capture freshness; failure latches a stop. Metadata,
-// data, and paused phases are all eligible with focus+armed. No phase is a
-// persistence signal. Call periodically even when no command is being sent.
+// Check validates the binding and finite request budget, not the age of a static
+// page. Capture timestamps validate incoming evidence, never keyboard authority.
 func (r *Receiver) Check(now time.Time) error {
 	if !r.bound {
 		return ErrUnbound
 	}
-	if !eligible(r.current, now) {
+	if r.current.Beacon.Flags&focusArmed == 0 {
 		return r.stop(ErrIneligible)
 	}
 	if r.budgetExpired(now) {
@@ -130,34 +134,42 @@ func (r *Receiver) Check(now time.Time) error {
 
 func (r *Receiver) budgetExpired(now time.Time) bool {
 	p := r.pending
-	return p != nil && p.Attempts >= MaxSends && !now.Before(p.Deadline)
+	return !r.finishing && p != nil && p.Attempts >= MaxSends && !now.Before(p.Deadline)
 }
 
-// Observe returns true only for a fresh, strictly newer matching echo captured
-// after the first completed Enter. Stale/prebind/duplicate same-binding frames
-// do not change focus, nonce, highwater, or freshness. Identity changes stop even
-// on old frames. A true result releases the command, not the next data request.
-// An expired current capture stops before any renewal. While AwaitingSent,
-// accepted observations update freshness/highwater but cannot acknowledge a send.
+// Observe validates incoming acquisitions, not the age of the previous page.
+// Identity changes and conflicting same-frame content stop control. Echoes must
+// exceed the first reservation's highwater/time and cannot acknowledge before Sent.
 func (r *Receiver) Observe(o Observation, now time.Time) (bool, error) {
+	result, err := r.ObserveFrame(o, now)
+	return result.Acknowledged, err
+}
+
+// ObservationResult separates admission of packet-bearing evidence from a page
+// acknowledgement. Ignored images may not advance durable receive progress.
+type ObservationResult struct{ Admitted, Acknowledged bool }
+
+// ObserveFrame reports whether this acquisition may supply packets to storage.
+func (r *Receiver) ObserveFrame(o Observation, now time.Time) (ObservationResult, error) {
 	if !r.bound {
-		return false, ErrUnbound
+		return ObservationResult{}, ErrUnbound
 	}
 	b, prev := o.Beacon, r.current.Beacon
 	if b.Descriptor != prev.Descriptor || b.Epoch != prev.Epoch || o.Generation != r.current.Generation {
-		return false, r.stop(ErrBindingChanged)
+		return ObservationResult{}, r.stop(ErrBindingChanged)
 	}
-	if !fresh(r.current, now) {
-		return false, r.stop(ErrIneligible)
+	if b.Frame == prev.Frame && b != prev {
+		return ObservationResult{}, r.stop(ErrConflict)
 	}
 	if b.Frame <= prev.Frame || !o.CapturedAt.After(r.cutoff) || !fresh(o, now) {
-		return false, nil
+		return ObservationResult{}, nil
 	}
 	if err := r.acceptable(o, now); err != nil {
-		return false, r.stop(err)
+		return ObservationResult{}, r.stop(err)
 	}
 	r.current = o
-	return r.echo(o)
+	ack, err := r.echo(o)
+	return ObservationResult{Admitted: err == nil, Acknowledged: ack}, err
 }
 
 func (r *Receiver) acceptable(o Observation, now time.Time) error {
@@ -176,7 +188,7 @@ func (r *Receiver) acceptable(o Observation, now time.Time) error {
 func (r *Receiver) echo(o Observation) (bool, error) {
 	c := Command{o.Beacon.Nonce, o.Beacon.Ordinal}
 	if r.pending != nil && c == r.pending.Command {
-		if r.pending.AwaitingSent || r.pending.IssuedAt.IsZero() || !o.CapturedAt.After(r.pending.IssuedAt) {
+		if r.pending.AwaitingSent || r.pending.IssuedAt.IsZero() || !o.CapturedAt.After(r.pending.firstReservation) || o.Beacon.Frame <= r.pending.baselineFrame {
 			return false, nil
 		}
 		r.confirmed, r.pending = c, nil
@@ -214,6 +226,9 @@ func (r *Receiver) beforeSend(now time.Time, check Eligibility) error {
 // Execute returned Command immediately, then call Sent with Enter completion
 // time, or Stop on any failure. A reservation is not a completed send.
 func (r *Receiver) Begin(ordinal uint64, ready bool, now time.Time, check Eligibility) (Command, error) {
+	if r.finishing {
+		return Command{}, ErrTerminal
+	}
 	if r.pending != nil {
 		return Command{}, ErrPending
 	}
@@ -236,7 +251,7 @@ func (r *Receiver) reserve(ordinal uint64, now time.Time) Command {
 	} else {
 		r.next++
 	}
-	r.pending = &Pending{Command: c, AwaitingSent: true}
+	r.pending = &Pending{Command: c, AwaitingSent: true, firstReservation: now, baselineFrame: r.current.Beacon.Frame}
 	r.reservedAt = now
 	return c
 }
@@ -251,8 +266,8 @@ func (r *Receiver) Pending() (Pending, bool) {
 
 // Sent records successful Enter completion for a reserved send. The same owner
 // may process observations during the send; concurrent mutations are forbidden.
-// Such observations are not replayed: acknowledgment requires a strictly newer
-// frame observed after Sent, captured after the first Enter completion.
+// Such observations are not replayed. Production callers process captured echoes
+// after Sent, allowing acquisition between Enter-down and Enter-up.
 // Invalid completion stops control.
 func (r *Receiver) Sent(enterCompletedAt time.Time) error {
 	p := r.pending
@@ -274,9 +289,12 @@ func (r *Receiver) Sent(enterCompletedAt time.Time) error {
 }
 
 // Retry reserves a due retry of exactly the same command. Poll while receiving
-// heartbeat observations; no timer or automatic execution exists. ready=false
+// or without new observations; no timer or automatic execution exists. ready=false
 // means wait/no pending; err means stop. The third timeout exhausts the budget.
 func (r *Receiver) Retry(now time.Time, check Eligibility) (command Command, ready bool, err error) {
+	if r.finishing {
+		return Command{}, false, ErrTerminal
+	}
 	if err = r.Check(now); err != nil {
 		return
 	}
@@ -292,4 +310,31 @@ func (r *Receiver) Retry(now time.Time, check Eligibility) (command Command, rea
 	}
 	p.AwaitingSent, r.reservedAt = true, now
 	return p.Command, true, nil
+}
+
+// BeginFinish reserves a one-shot terminal nonce only after durable completion.
+// Send immediately; never retry or call Sent for FINISH. Check/Observe remain
+// active during sending. An old pending page is retained only for echo provenance,
+// not scheduling. Stop on send failure; only an explicit Bind starts a new session.
+func (r *Receiver) BeginFinish(ready bool, now time.Time, check Eligibility) (uint64, error) {
+	if r.finishing {
+		return 0, ErrTerminal
+	}
+	if !ready {
+		return 0, ErrNotReady
+	}
+	if r.pending != nil && r.pending.AwaitingSent {
+		return 0, ErrPending
+	}
+	if err := r.beforeSend(now, check); err != nil {
+		return 0, err
+	}
+	if r.next == 0 {
+		return 0, r.stop(ErrExhausted)
+	}
+	nonce := r.next
+	// Unsigned wrap marks exhaustion; the terminal latch prevents reuse.
+	r.next++
+	r.finishing = true
+	return nonce, nil
 }

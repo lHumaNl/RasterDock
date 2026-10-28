@@ -32,7 +32,7 @@ func TestInputCheckProfileScheduleBounds(t *testing.T) {
 func TestInputCheckProfileNativeStageOrder(t *testing.T) {
 	dir := t.TempDir()
 	source, binary := filepath.Join(dir, "timing.m"), filepath.Join(dir, "timing")
-	needle := "reset(); check(RD_CODE_UNKNOWN, RD_STAGE_UNKNOWN, 1, (rd_input_diagnostic){0});"
+	needle := "reset(); check(RD_CODE_UNKNOWN, RD_STAGE_UNKNOWN, 0, (rd_input_diagnostic){0});"
 	harness := strings.Replace(inputFocusHarness, needle, checkProfileOrderFixture, 1)
 	if harness == inputFocusHarness {
 		t.Fatal("fixture insertion point missing")
@@ -51,11 +51,11 @@ func TestInputCheckProfileNativeStageOrder(t *testing.T) {
 const checkProfileOrderFixture = `
 rd_input_timing timing = {.start_ns = 1};
 rd_input_timing_attach(&timing);
-reset(); check(RD_CODE_UNKNOWN, RD_STAGE_UNKNOWN, 1, (rd_input_diagnostic){0});
+reset(); check(RD_CODE_UNKNOWN, RD_STAGE_UNKNOWN, 0, (rd_input_diagnostic){0});
 rd_input_timing_attach(NULL);
-assert(timing.count == 4 && !timing.overflow);
+assert(timing.count == 2 && !timing.overflow);
 for (unsigned i = 0; i < timing.count; i++) {
-    assert(timing.records[i].stage == (i < 2 ? RD_STAGE_FOCUSED_WINDOW : RD_STAGE_AX_TITLE));
+    assert(timing.records[i].stage == RD_STAGE_FOCUSED_WINDOW);
     assert(timing.records[i].op == (i % 2 ? RD_TIMING_AX_QUERY : RD_TIMING_TIMEOUT));
     assert(timing.records[i].has_ax_error && timing.records[i].ax_error == 0);
     assert(timing.records[i].offset_ns == 0 && timing.records[i].remaining_ns == 99);

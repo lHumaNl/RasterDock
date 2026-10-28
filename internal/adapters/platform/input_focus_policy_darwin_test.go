@@ -35,7 +35,7 @@ func runFocusCommand(t *testing.T, name string, args ...string) {
 	}
 }
 
-func TestInputFocusPolicyRetainsBindAndCGGuards(t *testing.T) {
+func TestInputFocusPolicyRetainsBindGuards(t *testing.T) {
 	data, err := os.ReadFile("input_darwin.m")
 	if err != nil {
 		t.Fatal(err)
@@ -45,8 +45,8 @@ func TestInputFocusPolicyRetainsBindAndCGGuards(t *testing.T) {
 		"static const CFIndex maxAXWindows = 16;",
 		"if (!title) { matches = 0; break; }",
 		"if (matches != 1) return refuse(d, RD_STAGE_CG_UNIQUE, RD_CODE_NOT_UNIQUE);",
-		"!local_gate(b, deadline, d, RD_STAGE_LOCAL_FIRST) || !owned_unique_window(b, deadline, d) || !focused_window(b, deadline, d)",
-		"!local_gate(b, deadline, d, RD_STAGE_LOCAL_SECOND)",
+		"if (!owned_unique_window(b, deadline, d)) return 0;",
+		"if (!rd_input_capability() || !CGPreflightScreenCaptureAccess())",
 	} {
 		if !strings.Contains(string(data), guard) {
 			t.Errorf("missing preserved guard: %s", guard)
@@ -148,11 +148,12 @@ int main(void) {
     app = string("application identity"); pinned = string("pinned identity"); other = string("other identity");
     title = string("bound title"); changed = string("changed title");
     wrongType = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
-    reset(); check(RD_CODE_UNKNOWN, RD_STAGE_UNKNOWN, 1, (rd_input_diagnostic){0});
+    reset(); check(RD_CODE_UNKNOWN, RD_STAGE_UNKNOWN, 0, (rd_input_diagnostic){0});
     reset(); focusValue = other; check(RD_CODE_FOCUS_IDENTITY, RD_STAGE_FOCUSED_WINDOW, 0, (rd_input_diagnostic){0});
-    reset(); titleValue = changed; check(RD_CODE_TITLE, RD_STAGE_AX_TITLE, 1, (rd_input_diagnostic){0});
-    failure_cases(RD_STAGE_FOCUSED_WINDOW); failure_cases(RD_STAGE_AX_TITLE);
-    reset(); lateCleanup = 1; check(RD_CODE_BUDGET, RD_STAGE_FOCUSED_WINDOW, 1, (rd_input_diagnostic){0});
+    // Live titles may change after Bind: retained AX object equality is authoritative.
+    reset(); titleValue = changed; check(RD_CODE_UNKNOWN, RD_STAGE_UNKNOWN, 0, (rd_input_diagnostic){0});
+    failure_cases(RD_STAGE_FOCUSED_WINDOW);
+    reset(); lateCleanup = 1; check(RD_CODE_BUDGET, RD_STAGE_FOCUSED_WINDOW, 0, (rd_input_diagnostic){0});
     reset(); focusValue = other;
     check(RD_CODE_QUERY, RD_STAGE_AX_TITLE, 0, (rd_input_diagnostic){RD_STAGE_AX_TITLE, RD_CODE_QUERY, 1, kAXErrorCannotComplete});
     CFRelease(app); CFRelease(pinned); CFRelease(other); CFRelease(title); CFRelease(changed); CFRelease(wrongType);

@@ -85,7 +85,7 @@ func runCapturedHeldProfile(ctx context.Context, t *testing.T, profile *platform
 	logHeldProfile(t, ready, profile.Samples(), capture.steps)
 	logHeldProfileStop(t, err)
 	inputDiagnosticMust(t, "held.sample_completion", err)
-	t.Log("diagnostic PASS: two held observations with frame advance; zero keys; NOT transfer/input-delivery evidence")
+	t.Log("diagnostic PASS: valid static held observation; zero keys; NOT transfer/input-delivery evidence")
 }
 
 func logHeldProfileStop(t *testing.T, err error) {

@@ -37,9 +37,10 @@ func begin(t *testing.T, r *Receiver, now time.Time) Command {
 
 func TestOldFramesCannotRefresh(t *testing.T) {
 	r, o := bound(t)
+	o.Beacon.Frame--
 	o.Beacon.Flags = 0
 	assertObservation(t, r, o, start, false, nil)
-	o.Beacon.Frame++
+	o.Beacon.Frame += 2
 	assertObservation(t, r, o, start.Add(time.Millisecond), false, nil)
 	o.CapturedAt = start.Add(time.Millisecond)
 	assertObservation(t, r, o, o.CapturedAt, false, ErrIneligible)
@@ -91,8 +92,9 @@ func TestStaleCaptureDoesNotRefresh(t *testing.T) {
 	if err := r.Check(start.Add(Freshness)); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Check(start.Add(Freshness + time.Nanosecond)); err == nil {
-		t.Fatal("stale frame refreshed freshness")
+	// Static pages do not expire keyboard authority.
+	if err := r.Check(start.Add(Freshness + time.Nanosecond)); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -121,10 +123,10 @@ func confirmAfterEnter(t *testing.T, r *Receiver, o *Observation, c Command) {
 		t.Fatal(err)
 	}
 	o.Beacon.Frame++
-	assertObservation(t, r, *o, o.CapturedAt, false, nil)
+	assertObservation(t, r, *o, o.CapturedAt, true, nil)
 	o.Beacon.Frame++
 	o.CapturedAt = o.CapturedAt.Add(time.Millisecond)
-	assertObservation(t, r, *o, o.CapturedAt, true, nil)
+	assertObservation(t, r, *o, o.CapturedAt, false, nil)
 }
 
 func TestOldArmedFrameCannotRefreshOrConflict(t *testing.T) {
@@ -133,7 +135,7 @@ func TestOldArmedFrameCannotRefreshOrConflict(t *testing.T) {
 	o.Beacon.Nonce = 99
 	o.CapturedAt = start.Add(Freshness)
 	assertObservation(t, r, o, o.CapturedAt, false, nil)
-	if err := r.Check(o.CapturedAt.Add(time.Nanosecond)); !errors.Is(err, ErrIneligible) {
+	if err := r.Check(o.CapturedAt.Add(time.Nanosecond)); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -194,16 +196,17 @@ func ignoredCaptures() map[string]func(*Observation) {
 	}
 }
 
-func TestObserveCannotReviveExpiredBinding(t *testing.T) {
+func TestObserveStaticPageDoesNotExpireBinding(t *testing.T) {
 	for _, newer := range []bool{false, true} {
 		r, o := bound(t)
 		if newer {
 			o.Beacon.Frame++
 		}
 		o.CapturedAt = start.Add(Freshness + time.Nanosecond)
-		assertObservation(t, r, o, o.CapturedAt, false, ErrIneligible)
-		assertFreshUntil(t, r, time.Time{})
-		assertObservation(t, r, o, o.CapturedAt, false, ErrUnbound)
+		assertObservation(t, r, o, o.CapturedAt, false, nil)
+		if err := r.Check(o.CapturedAt); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -225,5 +228,81 @@ func TestFirstReservationEchoRetainsPending(t *testing.T) {
 	assertFreshUntil(t, r, o.CapturedAt.Add(Freshness))
 	if p, ok := r.Pending(); !ok || p != reserved {
 		t.Fatal("first reservation changed", p)
+	}
+}
+
+func TestEchoAcquiredDuringSendEvaluatedAfterSent(t *testing.T) {
+	r, o := bound(t)
+	c := begin(t, r, start)
+	o.CapturedAt = start.Add(time.Millisecond)
+	o.Beacon.Frame++
+	o.Beacon.Nonce, o.Beacon.Ordinal = c.Nonce, c.Ordinal
+	sent(t, r, start.Add(2*time.Millisecond))
+	assertObservation(t, r, o, start.Add(3*time.Millisecond), true, nil)
+}
+
+func TestSameFrameConflictingContentStops(t *testing.T) {
+	r, o := bound(t)
+	o.Beacon.Flags ^= 1
+	assertObservation(t, r, o, start, false, ErrConflict)
+}
+
+func TestSenderFocusIgnoredAndStaticRetryBounded(t *testing.T) {
+	o := observation(start)
+	o.Beacon.Flags = 2
+	r := &Receiver{}
+	if err := r.Bind(o.Beacon.Descriptor, o, start); err != nil {
+		t.Fatal(err)
+	}
+	c := begin(t, r, start.Add(time.Hour))
+	sent(t, r, start.Add(time.Hour))
+	for range MaxSends - 1 {
+		p, _ := r.Pending()
+		got, ready, err := r.Retry(p.RetryAt, allow)
+		if err != nil || !ready || got != c {
+			t.Fatal(got, ready, err)
+		}
+		sent(t, r, p.RetryAt)
+	}
+	p, _ := r.Pending()
+	if err := r.Check(p.Deadline); !errors.Is(err, ErrTimeout) {
+		t.Fatal(err)
+	}
+}
+
+func TestPreReservationCaptureCannotAcknowledge(t *testing.T) {
+	r, o := bound(t)
+	c := begin(t, r, start.Add(2*time.Millisecond))
+	sent(t, r, start.Add(3*time.Millisecond))
+	o.CapturedAt = start.Add(time.Millisecond)
+	o.Beacon.Frame++
+	o.Beacon.Nonce, o.Beacon.Ordinal = c.Nonce, c.Ordinal
+	assertObservation(t, r, o, start.Add(4*time.Millisecond), false, nil)
+	if _, pending := r.Pending(); !pending {
+		t.Fatal("old capture acknowledged request")
+	}
+}
+
+func TestWrongPageAndDuplicatesDoNotRenewPendingBudget(t *testing.T) {
+	r, o := bound(t)
+	begin(t, r, start)
+	sent(t, r, start)
+	for attempt := 1; attempt <= MaxSends; attempt++ {
+		p, _ := r.Pending()
+		o.Beacon.Frame++
+		o.CapturedAt = p.Deadline.Add(-time.Millisecond)
+		assertObservation(t, r, o, o.CapturedAt, false, nil)
+		assertObservation(t, r, o, o.CapturedAt, false, nil)
+		if got, _ := r.Pending(); got != p {
+			t.Fatal("wrong page renewed deadline")
+		}
+		if attempt < MaxSends {
+			if _, ready, err := r.Retry(p.RetryAt, allow); err != nil || !ready {
+				t.Fatal(ready, err)
+			}
+			sent(t, r, p.RetryAt)
+		} else if err := r.Check(p.Deadline); !errors.Is(err, ErrTimeout) {
+			t.Fatal(err)
+		}
 	}
 }

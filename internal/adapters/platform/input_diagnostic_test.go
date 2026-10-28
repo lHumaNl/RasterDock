@@ -39,6 +39,20 @@ func TestInputDiagnosticUnknown(t *testing.T) {
 	}
 }
 
+func TestInputDiagnosticCategories(t *testing.T) {
+	for code := InputCodeUnknown; code <= InputCodeTargetInvalid+1; code++ {
+		err := fmt.Errorf("check: %w", &InputDiagnosticError{Code: code})
+		focus := code == InputCodeFrontmost || code == InputCodeFocusIdentity
+		process := code == InputCodeProcessStartChanged
+		if errors.Is(err, ErrInputFocusLost) != focus || errors.Is(err, ErrInputProcessGone) != process {
+			t.Errorf("incorrect category for %v", code)
+		}
+		if !errors.Is(err, ErrInputUnavailable) {
+			t.Errorf("lost compatibility for %v", code)
+		}
+	}
+}
+
 func TestInputDiagnosticCheckLatches(t *testing.T) {
 	b := fakeInput(t)
 	want := &InputDiagnosticError{Stage: InputStageLocalFirst, Code: InputCodeModifiers}

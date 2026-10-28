@@ -83,7 +83,7 @@ func TestAppliedPublicationChecksLayoutBeforeAcknowledgement(t *testing.T) {
 	for _, restore := range []bool{false, true} {
 		v, io := viewerFixture(t)
 		ctx, cancel := context.WithCancel(t.Context())
-		u := &controlUI{focusState: func() (bool, uint64) { return true, 0 }}
+		u := &controlUI{}
 		u.authorized.Store(true)
 		err := v.publish(ctx, 1, 1, func(s snapshot) {
 			io.viewport.store(image.Pt(1, 1), s.picture.Bounds().Size())
@@ -107,7 +107,7 @@ func TestAppliedPublicationChecksLayoutBeforeAcknowledgement(t *testing.T) {
 
 func TestValidUIPublicationCommits(t *testing.T) {
 	v, io := viewerFixture(t)
-	u := &controlUI{focusState: func() (bool, uint64) { return true, 0 }}
+	u := &controlUI{}
 	u.authorized.Store(true)
 	painted := false
 	err := v.publish(t.Context(), 1, 1, func(s snapshot) {
@@ -134,25 +134,18 @@ func TestQuarantineCannotExitThroughKeyboard(t *testing.T) {
 	}
 }
 
-func TestFocusGenerationLatchesLoss(t *testing.T) {
-	generation := uint64(4)
-	u := &controlUI{focusState: func() (bool, uint64) { return true, generation }}
-	u.focusGeneration.Store(generation)
+func TestSenderAuthorizationIgnoresOSFocus(t *testing.T) {
+	u := &controlUI{} // No OS-focus dependency exists on the sender.
 	u.authorized.Store(true)
-	if !u.focused() {
-		t.Fatal("initial focus rejected")
+	if !u.authorizedNow() {
+		t.Fatal("explicit authorization rejected")
 	}
-	generation++ // The window lost and regained focus between polls.
-	if u.focused() || u.authorized.Load() {
-		t.Fatal("loss was not latched")
+	u.authorized.Store(false)
+	if u.authorizedNow() {
+		t.Fatal("explicit cancellation ignored")
 	}
-	generation--
-	if u.focused() {
-		t.Fatal("authorization silently restored")
-	}
-	generation += 2
-	if !u.authorizeFocus() || !u.focused() {
-		t.Fatal("explicit new arm did not reset baseline")
+	if !u.authorize() || !u.authorizedNow() {
+		t.Fatal("explicit new arm did not authorize")
 	}
 }
 
@@ -188,7 +181,7 @@ func TestControlMailboxCarriesPictureAcknowledgement(t *testing.T) {
 func TestLayoutLossDuringPaintingRejectsAcknowledgement(t *testing.T) {
 	v, io := viewerFixture(t)
 	ctx, cancel := context.WithCancel(t.Context())
-	u := &controlUI{focusState: func() (bool, uint64) { return true, 0 }}
+	u := &controlUI{}
 	u.authorized.Store(true)
 	err := v.publish(ctx, 1, 1, func(s snapshot) {
 		u.paint(s, func() { io.viewport.store(image.Pt(1, 1), s.picture.Bounds().Size()) })

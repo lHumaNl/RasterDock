@@ -142,9 +142,9 @@ func (s *controlCaptureStream) checkClockLocked() error {
 	return s.clock.check(uint64(ticks.absolute0), uint64(ticks.continuous), uint64(ticks.absolute1), uint64(ticks.numerator), uint64(ticks.denominator))
 }
 
-// CheckControlAge must be called immediately before EVERY control key, including
-// when reusing an older decoded frame. Go's monotonic clock alone misses sleep.
-// Failure irrevocably invalidates all frames from this stream generation.
+// CheckControlAge validates source and clock continuity at capture/binding
+// checkpoints. The event-driven receiver does not call it between keys; live
+// process/window guards authorize input. Failure revokes this stream generation.
 func (s *controlCaptureStream) CheckControlAge() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

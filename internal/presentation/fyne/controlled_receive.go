@@ -22,9 +22,49 @@ type plannedReceiveOwner interface {
 	NextMissing() (uint64, bool, error)
 }
 
+const (
+	controlDecodeFailureLimit    = 5
+	controlInitialCaptureTimeout = 2 * time.Second
+	controlCapturePollInterval   = 250 * time.Millisecond
+)
+
 // One owner serializes capture, persistence, planning and keyboard requests.
 // No source Prepared object or sender packet identities enter this path.
 func runControlledReceive(ctx context.Context, root string, cmd command, commands <-chan command, emit func(snapshot), io engineIO) (err error) {
+	saved := false
+	cleanupFailed := false
+	closeOwner := func(closeErr error) {
+		if closeErr != nil {
+			cleanupFailed = true
+			err = errors.Join(err, closeErr)
+		}
+	}
+	var pinnedTarget platform.ControlTarget
+	var pinnedDescriptor v1.Descriptor
+	if cmd.resume != nil {
+		pinnedTarget, pinnedDescriptor = cmd.resume.target, cmd.resume.descriptor
+	}
+	defer func() {
+		if !saved && !cleanupFailed && errors.Is(err, platform.ErrInputFocusLost) && !errors.Is(err, platform.ErrInputProcessGone) && pinnedTarget.Valid() {
+			cmd.resume = nil
+			err = &receivePausedError{resume: &receiveResume{command: cmd, target: pinnedTarget, descriptor: pinnedDescriptor}, cause: err}
+		}
+	}()
+	// This runs after all owner cleanup. A terminal-send or cleanup failure must
+	// never misreport already verified/published files as an incomplete transfer.
+	defer func() {
+		if !saved {
+			return
+		}
+		key := "control.complete"
+		params := map[string]interface{}{}
+		if err != nil {
+			key = "control.complete_finish_unconfirmed"
+			params["reason"] = err.Error()
+		}
+		emit(snapshot{key: key, params: params, session: cmd.session})
+		err = nil
+	}()
 	if io.controlCapture == nil || io.controlDecode == nil || io.bindInput == nil {
 		return errors.New("controlled capture/input capability unavailable")
 	}
@@ -46,15 +86,19 @@ func runControlledReceive(ctx context.Context, root string, cmd command, command
 	if err != nil {
 		return err
 	}
-	defer func() { err = errors.Join(err, stream.Close()) }()
+	defer func() { closeOwner(stream.Close()) }()
 	input, err := io.bindInput(cmd.window)
 	if err != nil {
 		return err
 	}
-	defer func() { err = errors.Join(err, input.Close()) }()
+	defer func() { closeOwner(input.Close()) }()
+	pinnedTarget = input.Target()
+	if cmd.resume != nil && pinnedTarget != cmd.resume.target {
+		return errors.New("resume input target identity changed")
+	}
 	refreshing, ok := input.(platform.RefreshingInputBinding)
 	if !ok {
-		return errors.New("input adapter cannot refresh control observations between keys")
+		return errors.New("input adapter cannot run bounded serialized control commands")
 	}
 	clock, ok := stream.(interface {
 		CheckControlAge() error
@@ -73,23 +117,44 @@ func runControlledReceive(ctx context.Context, root string, cmd command, command
 		return clock.CheckControlAge()
 	}
 	check := func() error {
-		if err := checkCapture(); err != nil {
+		if err := controlContinue(ctx, commands); err != nil {
 			return err
 		}
+		// Classify process/focus loss before capture visibility errors can mask it
+		// (for example when the operator minimizes the selected client window).
 		if err := input.Check(); err != nil {
 			return fmt.Errorf("control.input_check: %w", err)
 		}
-		return nil
+		return checkCapture()
 	}
 	var receiver plannedReceiveOwner
 	defer func() {
 		if receiver != nil {
-			err = errors.Join(err, receiver.Close())
+			closeOwner(receiver.Close())
 		}
 	}()
 	gate := &control.Receiver{}
 	defer gate.Stop()
+	// Native input owns the live process/focus checks. Never capture, decode or
+	// query window titles between key events.
+	eligible := func() error {
+		return controlContinue(ctx, commands)
+	}
+	refresh := func(refreshCtx context.Context) error {
+		if err := refreshCtx.Err(); err != nil {
+			return err
+		}
+		return eligible()
+	}
 	bound := false
+	decodeFailures := 0
+	initialDeadline := time.Now().Add(controlInitialCaptureTimeout)
+	send := func(request control.Command) error {
+		if err := refreshing.SendWithRefresh(ctx, request.Nonce, request.Ordinal, refresh, eligible); err != nil {
+			return fmt.Errorf("control.send: %w", err)
+		}
+		return gate.Sent(time.Now())
+	}
 	for {
 		if err = controlContinue(ctx, commands); err != nil {
 			return err
@@ -101,9 +166,21 @@ func runControlledReceive(ctx context.Context, root string, cmd command, command
 			if err = gate.Check(time.Now()); err != nil {
 				return err
 			}
+			request, ready, retryErr := gate.Retry(time.Now(), check)
+			if retryErr != nil {
+				return retryErr
+			}
+			if ready {
+				if err = send(request); err != nil {
+					return err
+				}
+			}
 		}
 		capture, captureErr := nextControlledFrame(ctx, stream)
 		if errors.Is(captureErr, platform.ErrFramePending) {
+			if _, pending := gate.Pending(); !pending && !time.Now().Before(initialDeadline) {
+				return errors.New("control initial capture deadline expired")
+			}
 			continue
 		}
 		if captureErr != nil {
@@ -114,21 +191,26 @@ func runControlledReceive(ctx context.Context, root string, cmd command, command
 			if errors.Is(decodeErr, codec.ErrAmbiguousControl) {
 				return decodeErr
 			}
-			// A decode failure never renews the gate. Its original timestamp expires.
-			if !bound {
-				return fmt.Errorf("control bootstrap decode: %w", decodeErr)
+			decodeFailures++
+			if decodeFailures >= controlDecodeFailureLimit {
+				return fmt.Errorf("control consecutive decode failures: %w", decodeErr)
 			}
 			continue
 		}
+		decodeFailures = 0
 		observation := control.Observation{Beacon: beacon, CapturedAt: capture.ControlCapturedAt, Generation: capture.Generation, AgeBounded: capture.ControlAgeBounded}
 		if capture.Generation == 0 {
 			return errors.New("capture generation unavailable for control")
 		}
 		if !bound {
+			if cmd.resume != nil && cmd.resume.descriptor != (v1.Descriptor{}) && beacon.Descriptor != cmd.resume.descriptor {
+				return errors.New("resume descriptor changed")
+			}
 			if err = gate.Bind(beacon.Descriptor, observation, time.Now()); err != nil {
 				return err
 			}
 			bound = true
+			pinnedDescriptor = beacon.Descriptor
 			if cmd.session == "" {
 				id, e := domain.NewID()
 				if e != nil {
@@ -151,17 +233,18 @@ func runControlledReceive(ctx context.Context, root string, cmd command, command
 			if err = gate.Check(time.Now()); err != nil {
 				return err
 			}
-			if _, err = gate.Observe(observation, time.Now()); err != nil {
-				return err
+			admission, observeErr := gate.ObserveFrame(observation, time.Now())
+			if observeErr != nil {
+				return observeErr
+			}
+			if !admission.Admitted {
+				continue
 			}
 		}
 		if err = receiver.CheckDescriptor(beacon.Descriptor); err != nil {
 			return err
 		}
 		if err = persistControlledPackets(receiver, packets); err != nil {
-			return err
-		}
-		if err = check(); err != nil {
 			return err
 		}
 		ordinal, missing, planErr := receiver.NextMissing()
@@ -181,48 +264,44 @@ func runControlledReceive(ctx context.Context, root string, cmd command, command
 			if published != total {
 				return errors.New("all packets present but publication incomplete")
 			}
-			emit(snapshot{key: "control.complete", session: cmd.session})
-			return nil
+			saved = true
+			return finishControlledReceive(ctx, input, gate, check, refresh, eligible)
 		}
-		var request control.Command
-		ready := true
+		if err = check(); err != nil {
+			return err
+		}
 		if _, pending := gate.Pending(); pending {
-			request, ready, err = gate.Retry(time.Now(), check)
-		} else {
-			// The plan was computed after every Accept/flush and Publish above.
-			request, err = gate.Begin(ordinal, true, time.Now(), check)
+			continue // Retry scheduling happens before capture, even for ignored frames.
 		}
+		// The plan was computed after every Accept/flush and Publish above.
+		request, err := gate.Begin(ordinal, true, time.Now(), check)
 		if err != nil {
 			return err
 		}
-		if ready {
-			if err = refreshing.SendWithRefresh(ctx, request.Nonce, request.Ordinal, func(refreshCtx context.Context) error {
-				if err := refreshControlledObservation(refreshCtx, gate, stream, io.controlDecode, checkCapture); err != nil {
-					return fmt.Errorf("control.key_refresh: %w", err)
-				}
-				return nil
-			}, func() error {
-				if err := gate.Check(time.Now().Add(platform.InputGuardMargin)); err != nil {
-					return fmt.Errorf("control.key_gate: %w", err)
-				}
-				if err := checkCapture(); err != nil {
-					return fmt.Errorf("control.key_capture: %w", err)
-				}
-				return nil
-			}); err != nil {
-				return fmt.Errorf("control.send: %w", err)
-			}
-			if err = gate.Sent(time.Now()); err != nil {
-				return err
-			}
+		if err = send(request); err != nil {
+			return err
 		}
 	}
+}
+
+func finishControlledReceive(ctx context.Context, input platform.InputBinding, gate *control.Receiver, check control.Eligibility, refresh func(context.Context) error, eligible func() error) error {
+	terminal, ok := input.(platform.FinishingInputBinding)
+	if !ok {
+		return errors.New("input adapter cannot send terminal completion")
+	}
+	nonce, err := gate.BeginFinish(true, time.Now(), check)
+	if err != nil {
+		return err
+	}
+	// Deliberately no Sent/Retry or terminal ACK loop. This is the last input
+	// attempt even when native sending cannot confirm delivery.
+	return terminal.SendFinishWithRefresh(ctx, nonce, refresh, eligible)
 }
 
 // Control capture implementations must honor context cancellation. The short
 // lease keeps command revocation and gate expiry serviced by the same owner.
 func nextControlledFrame(ctx context.Context, stream captureStream) (platform.Frame, error) {
-	lease, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
+	lease, cancel := context.WithTimeout(ctx, controlCapturePollInterval)
 	defer cancel()
 	frame, err := stream.Next(lease)
 	if ctx.Err() != nil {

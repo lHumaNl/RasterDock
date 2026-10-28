@@ -90,7 +90,7 @@ func TestGeometryEngineResizePausesUntilExplicitResume(t *testing.T) {
 	}
 	h.send(command{kind: "auto"})
 	h.ticks <- time.Now()
-	h.expect("status.frame")
+	h.expect("status.timer_frame")
 }
 
 func TestGeometryEngineTransientResizeStillPauses(t *testing.T) {
